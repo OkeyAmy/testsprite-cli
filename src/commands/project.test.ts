@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import type * as NodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -19,6 +20,15 @@ import {
   runUpdate,
   parseTestIdAttributesFlag,
 } from './project.js';
+
+// readSecretFileGuarded reads the secret through the fd it opened, via
+// node:fs's readFileSync(fd, ...) overload. Wrap readFileSync in a pass-through
+// vi.fn so the #282 suite can inject a read failure after a successful open;
+// every other test keeps the real implementation.
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof NodeFs>();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
 
 const PROJECT_FIXTURE: CliProject = {
   id: 'project_b3c91efa',
@@ -2456,6 +2466,7 @@ describe('#282 — secret --*-file flags are guarded (structured error, exit 5, 
     const { credentialsPath } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-cred-ok-'));
     const credFile = join(dir, 'cred.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (dir), not user input.
     writeFileSync(credFile, '  tok-from-file\n');
     let sentBody: { credential?: string } | undefined;
     const fetchImpl = makeFetch((_url, init) => {
@@ -2587,18 +2598,61 @@ describe('#282 — secret --*-file flags are guarded (structured error, exit 5, 
       { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
     );
     expect(fetched).toBe(false);
-    // blindfold: manual — dry-run skips file reads; returns sample with the projectId we passed in
+    // Dry-run skips file reads; the sample carries the projectId we passed in.
     expect(result.projectId).toBe('p1');
   });
 
-  it('runCredential --credential-file unreadable after stat → VALIDATION_ERROR (exit 5)', async () => {
-    if (process.getuid?.() === 0) return; // root bypasses permission checks
+  it('runCredential --dry-run with missing --credential-file skips filesystem (returns sample)', async () => {
     const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-mode-'));
-    const f = join(dir, 'secret.txt');
-    writeFileSync(f, 'tok');
-    chmodSync(f, 0o000);
-    try {
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    const result = await runCredential(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'p1',
+        authType: 'API key',
+        credentialFile: missingPath(),
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(fetched).toBe(false);
+    expect(result).toEqual({ projectId: 'p1', authType: 'API key', rewroteCount: 0 });
+  });
+
+  describe('read fails after a successful open', () => {
+    afterEach(() => {
+      // mockReset() on the vi.fn(actual.readFileSync) double puts it back on
+      // the real fs call, so a failure here can't leak into later tests.
+      vi.mocked(readFileSync).mockReset();
+    });
+
+    // Injected rather than built with chmod(0o000): on win32 chmod only maps
+    // the write bit, so a mode-denied file stays readable there. Failing the
+    // fd read directly exercises the same branch on every platform.
+    it('runCredential --credential-file read error → VALIDATION_ERROR (exit 5), no network', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkdtempSync(join(tmpdir(), 'cli-cred-read-'));
+      const f = join(dir, 'secret.txt');
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (dir), not user input.
+      writeFileSync(f, 'tok');
+      const actual = await vi.importActual<typeof NodeFs>('node:fs');
+      // Only the guard's fd-based read fails; path-based reads (e.g. the
+      // credentials file) keep hitting the real filesystem.
+      vi.mocked(readFileSync).mockImplementation(((
+        file: NodeFs.PathOrFileDescriptor,
+        ...rest: unknown[]
+      ) => {
+        if (typeof file === 'number') {
+          throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+        }
+        return (actual.readFileSync as (...a: unknown[]) => unknown)(file, ...rest);
+      }) as typeof readFileSync);
       await expect(
         runCredential(
           {
@@ -2611,9 +2665,11 @@ describe('#282 — secret --*-file flags are guarded (structured error, exit 5, 
           },
           deps(credentialsPath),
         ),
-      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-    } finally {
-      chmodSync(f, 0o644);
-    }
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        nextAction: expect.stringContaining('permission denied reading'),
+      });
+    });
   });
 });

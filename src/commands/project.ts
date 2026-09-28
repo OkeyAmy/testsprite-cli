@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { createReadStream, readFileSync, statSync, type Stats } from 'node:fs';
+import { createReadStream, statSync, type Stats } from 'node:fs';
 import { basename, extname } from 'node:path';
 import { Readable } from 'node:stream';
 import { Command } from 'commander';
@@ -762,20 +762,18 @@ export async function runCredential(
     throw localValidationError(`--type must be one of: ${CLI_AUTH_TYPES.join(', ')}`);
   }
 
-  // Resolve the credential value (flag or file). Required for every type
-  // except `public` (which clears it).
-  let credential = opts.credential;
-  if (credential === undefined && opts.credentialFile !== undefined) {
-    credential = readSecretFileGuarded('credential-file', opts.credentialFile);
-  }
-  if (opts.authType !== 'public' && (credential === undefined || credential === '')) {
-    throw localValidationError(
+  // A credential (flag or file) is required for every type except `public`
+  // (which clears it). Presence only here: --credential-file is read after the
+  // dry-run early return so --dry-run never touches the filesystem.
+  const missingCredential = (): ApiError =>
+    localValidationError(
       '--credential (or --credential-file) is required unless --type is "public"',
     );
+  const credentialSupplied =
+    opts.credential !== undefined ? opts.credential !== '' : opts.credentialFile !== undefined;
+  if (opts.authType !== 'public' && !credentialSupplied) {
+    throw missingCredential();
   }
-
-  const body: Record<string, string> = { authType: opts.authType };
-  if (opts.authType !== 'public' && credential !== undefined) body.credential = credential;
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-cred-${randomUUID()}`;
   if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
@@ -791,6 +789,17 @@ export async function runCredential(
     out.print(sample, data => renderCredentialText(data as CliProjectCredentialResponse));
     return sample;
   }
+
+  let credential = opts.credential;
+  if (credential === undefined && opts.credentialFile !== undefined) {
+    credential = readSecretFileGuarded('credential-file', opts.credentialFile);
+  }
+  if (opts.authType !== 'public' && (credential === undefined || credential === '')) {
+    throw missingCredential();
+  }
+
+  const body: Record<string, string> = { authType: opts.authType };
+  if (opts.authType !== 'public' && credential !== undefined) body.credential = credential;
 
   const client = makeClient(opts, deps);
   const res = await client.put<CliProjectCredentialResponse>(
