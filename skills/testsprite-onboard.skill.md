@@ -216,9 +216,9 @@ testsprite test run <testId> --local <port> --local-host <host>  # local fronten
 
 Do **not** run the whole suite automatically. V3 frontend runs, including local runs,
 cost 0.5 credit each; check `testsprite usage` before sizing the suite.
-Local runs imply waiting (1200 seconds by default); one test per invocation, parallel
-invocations allowed, 5 live tunnel bindings per user. Keep the early stderr `Run <runId>`
-receipt. An owned local timeout cancels by default: start a new run with
+Local runs wait (1200 s per run). Put several in ONE `test run <id> <id> --local <port>`
+(one tunnel, 5 at a time); each process holds 1 of 5 tunnel slots. Keep the stderr
+`Run <runId>` receipt. An owned local timeout cancels by default: start a new run with
 `--local <port> --local-host <host> --timeout 1800` (same host), not `test wait`. A run cancelled before it finished is refunded.
 
 ### 6. Report
@@ -229,7 +229,7 @@ Tell the user, plainly:
 - "I smoke-ran **M** — here's the result: <pass/fail + the dashboard link from the run output>."
 - "To run the rest (≈X credits — state the cost so they choose knowingly):
   - frontend — use `test run <testId> --wait` for deployed targets or
-    `test run <testId> --local <port> --local-host <host>` for local targets (`--all --local` is refused);
+    `test run --all --project <id> --local <port> --local-host <host>` for local targets;
   - backend — `testsprite test run --all --project <id>` (wave-ordered, runs every BE test)."
 
 ## Quality checklist (self-check before reporting done)

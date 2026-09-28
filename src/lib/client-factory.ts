@@ -14,7 +14,7 @@
  * with the command.
  */
 import { loadConfig } from './config.js';
-import { defaultCredentialsPath } from './credentials.js';
+import { DEFAULT_PROFILE, defaultCredentialsPath } from './credentials.js';
 import { ApiError, localValidationError } from './errors.js';
 import { facadeBaseUrl } from './facade.js';
 import type { DebugEvent, FetchImpl, HttpClientOptions } from './http.js';
@@ -24,7 +24,7 @@ import {
   REQUEST_TIMEOUT_MAX_MS,
   REQUEST_TIMEOUT_MIN_MS,
 } from './http.js';
-import { globalShutdown } from './interrupt.js';
+import { globalShutdown, type ShutdownHandle } from './interrupt.js';
 import type { OutputMode } from './output.js';
 import { createDryRunFetch } from './dry-run/fetch.js';
 import { noteServerVersion } from './version-notice.js';
@@ -72,11 +72,13 @@ export interface ClientFactoryDeps {
   fetchImpl?: FetchImpl;
   stderr?: (line: string) => void;
   /**
-   * Shutdown signal composed into every outgoing fetch (DEV-331 piece 1).
+   * Shutdown signal composed into every outgoing fetch.
    * Defaults to `globalShutdown.signal` so an armed SIGINT/SIGTERM aborts an
    * in-flight request; tests inject their own controller's signal.
    */
   shutdownSignal?: AbortSignal;
+  /** Defaults to `globalShutdown` so disarmed signals can see in-flight requests. */
+  shutdown?: Pick<ShutdownHandle, 'runCriticalOperation'>;
 }
 
 /**
@@ -283,6 +285,24 @@ export function parseRequestTimeoutFlag(raw: string | undefined): number | undef
   return Math.round(n * 1000); // seconds → milliseconds
 }
 
+/**
+ * The profile name to echo in a missing-key error, or `undefined` to keep the
+ * generic wording.
+ *
+ * Two cases are deliberately not named. The default profile is the plain
+ * "not set up yet" case, where naming it adds nothing. And a name shaped like
+ * a TestSprite API key is withheld: the credentials-file guard only checks
+ * that a name is a safe INI section (`/^[A-Za-z0-9._-]+$/`), which every key
+ * format also satisfies, so `TESTSPRITE_PROFILE=$SOME_KEY_VAR` would otherwise
+ * print the key to stderr and into `details` under `--output json` — straight
+ * into a CI log.
+ */
+function nameableProfile(profile: string): string | undefined {
+  if (profile === DEFAULT_PROFILE) return undefined;
+  if (API_KEY_PREFIXES.some(prefix => profile.startsWith(prefix))) return undefined;
+  return profile;
+}
+
 export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}): HttpClient {
   return new HttpClient(resolveHttpClientOptions(opts, deps));
 }
@@ -321,6 +341,7 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
       env,
       requestTimeoutMs,
       shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
+      shutdown: deps.shutdown ?? globalShutdown,
     };
   }
 
@@ -335,7 +356,7 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
   // credentials) before the auth check so a config typo surfaces as a clear
   // VALIDATION_ERROR rather than an opaque URL throw or a retried "fetch failed".
   assertValidEndpointUrl(config.apiUrl);
-  if (!config.apiKey) throw ApiError.authRequired();
+  if (!config.apiKey) throw ApiError.authRequired(undefined, nameableProfile(config.profile));
   assertValidApiKey(config.apiKey);
   return {
     baseUrl: facadeBaseUrl(config.apiUrl),
@@ -358,6 +379,7 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
     env,
     requestTimeoutMs,
     shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
+    shutdown: deps.shutdown ?? globalShutdown,
   };
 }
 

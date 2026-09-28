@@ -21,9 +21,16 @@ import {
   makeHttpClient,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import { loadConfig } from '../lib/config.js';
-import { ApiError, CLIError, RequestTimeoutError, localValidationError } from '../lib/errors.js';
+import { loadConfig, resolveProfileName } from '../lib/config.js';
+import {
+  ApiError,
+  CLIError,
+  InterruptError,
+  RequestTimeoutError,
+  localValidationError,
+} from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
+import { globalShutdown } from '../lib/interrupt.js';
 import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
 import { formatOrgBinding, formatOrgsSummary, formatPersonalScopeHint } from '../lib/org-render.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
@@ -63,6 +70,8 @@ export interface DoctorDeps {
   env?: NodeJS.ProcessEnv;
   credentialsPath?: string;
   fetchImpl?: FetchImpl;
+  /** Process shutdown signal; injected for interrupt tests. */
+  shutdownSignal?: AbortSignal;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   /** Project dir for the skill check. Defaults to `process.cwd()`. */
@@ -243,6 +252,7 @@ async function checkConnectivity(
       credentialsPath: deps.credentialsPath,
       fetchImpl: deps.fetchImpl,
       stderr: deps.stderr,
+      shutdownSignal: deps.shutdownSignal,
     });
     const me = await client.get<MeIdentity>('/me', { schema: ME_IDENTITY_SCHEMA });
     const who = me.userId ? ` (userId ${me.userId})` : '';
@@ -253,6 +263,7 @@ async function checkConnectivity(
       org: me.org,
     };
   } catch (error) {
+    if (error instanceof InterruptError) throw error;
     if (error instanceof ApiError) {
       if (
         error.code === 'AUTH_REQUIRED' ||
@@ -302,6 +313,10 @@ async function checkLocalTunnel(
   if (!ctx.endpointOk) return { name, status: 'warn', detail: 'skipped; endpoint URL is invalid' };
 
   const controller = new AbortController();
+  const shutdownSignal = deps.shutdownSignal ?? globalShutdown.signal;
+  const onShutdown = () => controller.abort(shutdownSignal.reason);
+  if (shutdownSignal.aborted) onShutdown();
+  else shutdownSignal.addEventListener('abort', onShutdown, { once: true });
   const probeTimer = setTimeout(() => {
     controller.abort(new RequestTimeoutError(DOCTOR_TUNNEL_PROBE_TIMEOUT_MS));
   }, DOCTOR_TUNNEL_PROBE_TIMEOUT_MS);
@@ -314,9 +329,8 @@ async function checkLocalTunnel(
         credentialsPath: deps.credentialsPath,
         fetchImpl: deps.fetchImpl,
         stderr: deps.stderr,
-        // The retry sleeper listens to the client shutdown signal, so using
-        // the probe deadline here bounds attempts and Retry-After sleeps as
-        // one operation rather than timing each fetch independently.
+        // The retry sleeper listens to the client shutdown signal. Compose
+        // the probe deadline with process shutdown so either aborts the fetch.
         shutdownSignal: controller.signal,
       },
     );
@@ -330,6 +344,7 @@ async function checkLocalTunnel(
       detail: 'unexpected: the server resolved a probe id that should belong to nobody',
     };
   } catch (error) {
+    if (error instanceof InterruptError) throw error;
     if (!(error instanceof ApiError)) {
       return {
         name,
@@ -359,6 +374,7 @@ async function checkLocalTunnel(
     return { name, status: 'warn', detail: `could not check (${error.code})` };
   } finally {
     clearTimeout(probeTimer);
+    shutdownSignal.removeEventListener('abort', onShutdown);
   }
 }
 
@@ -410,18 +426,18 @@ export function createDoctorCommand(deps: DoctorDeps = {}): Command {
         '  testsprite doctor && testsprite test run <id>   # gate a command on a healthy setup',
     )
     .action(async (_cmdOpts, command: Command) => {
-      await runDoctor(resolveCommonOptions(command), deps);
+      await runDoctor(resolveCommonOptions(command, deps.env), deps);
     });
 
   return cmd;
 }
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,

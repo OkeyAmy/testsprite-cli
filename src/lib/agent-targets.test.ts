@@ -389,7 +389,7 @@ describe('renderForTarget("copilot")', () => {
 });
 
 // ---------------------------------------------------------------------------
-// ownFileBodyFor — the single per-target canonical-body rule (DEV-672)
+// ownFileBodyFor — the single per-target canonical-body rule
 // ---------------------------------------------------------------------------
 
 describe('ownFileBodyFor', () => {
@@ -491,6 +491,36 @@ describe('content integrity — testsprite-verify auth commands', () => {
       expect(content, name).toContain('testsprite setup');
       expect(content, name).not.toContain('auth whoami');
       expect(content, name).not.toContain('auth configure');
+    }
+  });
+});
+
+describe('content integrity — local run outcomes', () => {
+  it('installed verify skills explain adopted owner loss and conditional refunds', () => {
+    const assets = [
+      ['docs template', templateRaw],
+      ['own-file skill body', renderForTarget('claude', 'testsprite-verify').content],
+      ['codex skill body', renderForTarget('codex', 'testsprite-verify').content],
+    ] as const;
+
+    for (const [name, content] of assets) {
+      expect(content, name).toMatch(/owner (?:has disappeared|disappeared|disappears|is gone)/);
+      expect(content, name).toContain('--no-cancel-on-interrupt');
+      expect(content, name).toMatch(/attempts a refund/);
+      expect(content, name).toContain('refund.status');
+      expect(content, name).toMatch(/does not\s+guarantee a refund/);
+    }
+  });
+
+  it('installed verify skills qualify public environment tunnel preflight', () => {
+    const assets = [
+      ['docs template', templateRaw],
+      ['own-file skill body', renderForTarget('claude', 'testsprite-verify').content],
+    ] as const;
+
+    for (const [name, content] of assets) {
+      expect(content, name).toMatch(/can\s+(?:read|list) the project(?:'s)? environments/);
+      expect(content, name).toMatch(/server refuses[^.]*before dispatch/);
     }
   });
 });

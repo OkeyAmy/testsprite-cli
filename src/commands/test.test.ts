@@ -1,11 +1,14 @@
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -14,6 +17,7 @@ import type { RunResponse } from '../lib/runs.types.js';
 import { ApiError, InterruptError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT } from '../lib/output.js';
 import { ShutdownController } from '../lib/interrupt.js';
+import { defaultSleep } from '../lib/poll-support.js';
 import {
   type CliFailureContext,
   type CliLatestResult,
@@ -53,7 +57,22 @@ import {
   runTestRunAll,
   runTestRun,
   runTestRerun,
+  sleepUntilOrInterrupt,
 } from './test.js';
+
+it('clears a pending sleep timer when interrupted', async () => {
+  vi.useFakeTimers();
+  try {
+    const shutdown = new ShutdownController();
+    const pending = sleepUntilOrInterrupt(60_000, shutdown.signal, defaultSleep);
+    expect(vi.getTimerCount()).toBe(1);
+    shutdown.interrupt('SIGINT');
+    await expect(pending).rejects.toBe(shutdown.signal.reason);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
 
 function disableExits(cmd: Command): void {
   cmd.exitOverride();
@@ -232,7 +251,7 @@ describe('createTestCommand — surface', () => {
       '--cursor',
       '--rerun',
       '--no-rerun',
-      // DEV-1306: filter history by the credentials-supplying environment.
+      // Filters history by the credentials-supplying environment.
       '--env',
       '--columns',
       '--no-header',
@@ -370,6 +389,21 @@ describe('createTestCommand — surface', () => {
 });
 
 describe('runList', () => {
+  it('reports missing credentials before a missing project', async () => {
+    const credentialsPath = join(mkdtempSync(join(tmpdir(), 'cli-list-auth-')), 'credentials');
+    const test = createTestCommand({
+      credentialsPath,
+      env: {} as NodeJS.ProcessEnv,
+      stdout: () => undefined,
+    });
+
+    await expect(test.parseAsync(['list'], { from: 'user' })).rejects.toMatchObject({
+      code: 'AUTH_REQUIRED',
+      exitCode: 3,
+      nextAction: expect.stringContaining('testsprite setup'),
+    });
+  });
+
   it('passes projectId, type, and createdFrom to the facade query string', async () => {
     const { credentialsPath } = makeCreds();
     const seen: string[] = [];
@@ -858,7 +892,8 @@ describe('createTestCommand list — --cursor alias', () => {
 
 describe('createTestCommand list — required flag', () => {
   it('rejects when --project is missing with VALIDATION_ERROR (not commander)', async () => {
-    const test = createTestCommand();
+    const { credentialsPath } = makeCreds();
+    const test = createTestCommand({ credentialsPath, env: {} as NodeJS.ProcessEnv });
     disableExits(test);
     // We deliberately removed `.requiredOption` so the local validator
     // (`requireProjectId`) runs and throws the typed envelope. Commander's
@@ -1400,7 +1435,7 @@ describe('backendResultIsForThisRun — auto-resume stale-verdict floor (finding
   });
 });
 
-describe('backend wait fallback — testTitle overlay (DEV-1032 CI title)', () => {
+describe('backend wait fallback — testTitle overlay used for CI report titles', () => {
   // The non-terminal poll shape the fallback synthesizes FROM: the backend only
   // resolves `testTitle` on a TERMINAL run read, so a running poll carries null.
   const NON_TERMINAL_RUN: RunResponse = {
@@ -1442,7 +1477,7 @@ describe('backend wait fallback — testTitle overlay (DEV-1032 CI title)', () =
       expect(backendResultToRunResponse(RESULT_PASSED, NON_TERMINAL_RUN, '').testTitle).toBeNull();
     });
 
-    it('no title arg keeps the run row value (byte-identical to pre-DEV-1032)', () => {
+    it('no title arg keeps the run row value (byte-identical to the pre-overlay behavior)', () => {
       expect(backendResultToRunResponse(RESULT_PASSED, NON_TERMINAL_RUN).testTitle).toBeNull();
     });
   });
@@ -1492,7 +1527,7 @@ describe('backend wait fallback — testTitle overlay (DEV-1032 CI title)', () =
   });
 });
 
-describe('writeBatchJUnitReportIfRequested — testcase name precedence (DEV-1032)', () => {
+describe('writeBatchJUnitReportIfRequested — testcase name precedence', () => {
   let dir: string;
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'ts-junit-'));
@@ -2006,6 +2041,84 @@ describe('runCodeGet', () => {
     expect(readFileSync(target, 'utf-8')).toBe(STREAMED_CHUNKS.join(''));
   });
 
+  it('aborts a presigned body without replacing the output file', async () => {
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-interrupt-'));
+    const target = join(dir, 'code.ts');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture path built from this test's own mkdtempSync() dir, never user input
+    writeFileSync(target, 'existing source');
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+    let requestSignal: AbortSignal | undefined;
+    let presignedRequested = false;
+    const fetchImpl = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (String(input).includes('/tests/')) {
+        return Promise.resolve(new Response(JSON.stringify(TEST_CODE_PRESIGNED)));
+      }
+      presignedRequested = true;
+      requestSignal = init?.signal ?? undefined;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          bodyController = controller;
+          controller.enqueue(new TextEncoder().encode('partial source'));
+        },
+      });
+      requestSignal?.addEventListener(
+        'abort',
+        () => bodyController.error(new DOMException('The operation was aborted', 'AbortError')),
+        { once: true },
+      );
+      return Promise.resolve(new Response(body));
+    }) as typeof fetch;
+    const pending = runCodeGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_large', out: target },
+      { credentialsPath, fetchImpl, shutdown },
+    ).catch((err: unknown) => err);
+    await vi.waitFor(() => expect(presignedRequested).toBe(true));
+    const trackedDuringBody = shutdown.hasCriticalOperations;
+    shutdown.interrupt('SIGINT');
+    if (!requestSignal?.aborted) bodyController.error(shutdown.signal.reason);
+    expect(await pending).toBe(shutdown.signal.reason);
+    expect(trackedDuringBody).toBe(true);
+    expect(shutdown.hasCriticalOperations).toBe(false);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture path built from this test's own mkdtempSync() dir, never user input
+    expect(readFileSync(target, 'utf-8')).toBe('existing source');
+  });
+
+  it('maps an interrupted buffered presigned body to the shutdown reason', async () => {
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    let bodyReading = false;
+    const fetchImpl = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (String(input).includes('/tests/')) {
+        return Promise.resolve(new Response(JSON.stringify(TEST_CODE_PRESIGNED)));
+      }
+      const response = {
+        ok: true,
+        body: null,
+        text: () =>
+          new Promise<string>((_resolve, reject) => {
+            bodyReading = true;
+            init?.signal?.addEventListener(
+              'abort',
+              () => reject(new DOMException('The operation was aborted', 'AbortError')),
+              { once: true },
+            );
+          }),
+      } as Response;
+      return Promise.resolve(response);
+    }) as typeof fetch;
+    const pending = runCodeGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_large' },
+      { credentialsPath, fetchImpl, shutdown, rawStdout: () => undefined },
+    ).catch((err: unknown) => err);
+    await vi.waitFor(() => expect(bodyReading).toBe(true));
+    expect(shutdown.hasCriticalOperations).toBe(true);
+    shutdown.interrupt('SIGINT');
+    expect(await pending).toBe(shutdown.signal.reason);
+    expect(shutdown.hasCriticalOperations).toBe(false);
+  });
+
   it('--out rejects an empty path with VALIDATION_ERROR (exit 5) before any network I/O', async () => {
     const { credentialsPath } = makeCreds();
     let fetchCalls = 0;
@@ -2028,6 +2141,8 @@ describe('runCodeGet', () => {
   it('--out rejects a directory-style path with VALIDATION_ERROR (exit 5)', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = (() => Promise.resolve(new Response('{}'))) as typeof globalThis.fetch;
+    const dirStyleBase = mkdtempSync(join(tmpdir(), 'cli-p4-dirstyle-'));
+    const dirStyleOut = `${dirStyleBase}/`;
     await expect(
       runCodeGet(
         {
@@ -2035,11 +2150,13 @@ describe('runCodeGet', () => {
           output: 'text',
           debug: false,
           testId: 'test_fe',
-          out: '/tmp/some-dir/',
+          out: dirStyleOut,
         },
         { credentialsPath, fetchImpl },
       ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    )
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 })
+      .finally(() => rmSync(dirStyleBase, { recursive: true, force: true }));
   });
 
   it('--out rejects an existing directory path with VALIDATION_ERROR (exit 5) before any network I/O', async () => {
@@ -2078,19 +2195,24 @@ describe('runCodeGet', () => {
       fetchCalls += 1;
       return Promise.resolve(new Response('{}'));
     }) as typeof globalThis.fetch;
-    await expect(
-      runCodeGet(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          testId: 'test_fe',
-          out: `/tmp/_p4_no_such_dir_${process.pid}_${Date.now()}/out.py`,
-        },
-        { credentialsPath, fetchImpl },
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-    expect(fetchCalls).toBe(0);
+    const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p4-out-missing-parent-'));
+    try {
+      await expect(
+        runCodeGet(
+          {
+            profile: 'default',
+            output: 'text',
+            debug: false,
+            testId: 'test_fe',
+            out: join(missingParentBase, 'no-such-dir', 'out.py'),
+          },
+          { credentialsPath, fetchImpl },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      expect(fetchCalls).toBe(0);
+    } finally {
+      rmSync(missingParentBase, { recursive: true, force: true });
+    }
   });
 
   it('--out rejects a path whose parent is a regular file with VALIDATION_ERROR (exit 5)', async () => {
@@ -2375,7 +2497,7 @@ describe('runCodePut', () => {
     expect(called).toBe(0);
   });
 
-  it('rejects --language typescript / javascript (only python is supported) (DEV-232 / #210)', async () => {
+  it('rejects --language typescript / javascript (only python is supported) (#210)', async () => {
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('print("hi")');
     for (const lang of ['typescript', 'javascript'] as const) {
@@ -2405,7 +2527,7 @@ describe('runCodePut', () => {
     }
   });
 
-  it('rejects a non-Python (.ts) --code-file before sending (DEV-232)', async () => {
+  it('rejects a non-Python (.ts) --code-file before sending', async () => {
     const { credentialsPath } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-codeput-ts-'));
     const tsFile = join(dir, 'updated.spec.ts');
@@ -3395,6 +3517,7 @@ describe('runSteps', () => {
 
   it('--run-id run_failed_sample dry-run sample maps the failed step error and contributor flag', async () => {
     const out: string[] = [];
+    const noCredsDir = mkdtempSync(join(tmpdir(), 'cli-p5-no-creds-'));
     const page = await runSteps(
       {
         profile: 'default',
@@ -3406,11 +3529,11 @@ describe('runSteps', () => {
       },
       {
         env: {} as NodeJS.ProcessEnv,
-        credentialsPath: join(tmpdir(), 'testsprite-no-creds'),
+        credentialsPath: join(noCredsDir, 'testsprite-no-creds'),
         stdout: line => out.push(line),
         stderr: () => undefined,
       },
-    );
+    ).finally(() => rmSync(noCredsDir, { recursive: true, force: true }));
 
     const failing = page.items.find(step => step.stepIndex === 3);
     expect(failing).toMatchObject({
@@ -4293,7 +4416,7 @@ describe('runTestWaitMany', () => {
     }
   });
 
-  it('a Ctrl-C during a rate-limit backoff still detaches gracefully (DEV-331), not a hard exit', async () => {
+  it('a Ctrl-C during a rate-limit backoff still detaches gracefully', async () => {
     // `pollRunUntilTerminal` disarms the graceful scope in its own `finally`, so
     // the outer backoff has to re-arm it — otherwise the sleep is a window where
     // the first signal hard-exits with empty stdout.
@@ -4344,7 +4467,8 @@ describe('runTestWaitMany', () => {
     expect(armedDuringBackoff).toBe(true);
 
     expect(rejection).toBeInstanceOf(InterruptError);
-    // The DEV-331 contract: stdout stays parseable and names the still-running id.
+    expect((rejection as InterruptError).runWaitContext).toBe(true);
+    // Stdout stays parseable and names the still-running id.
     const payload = JSON.parse(out.join('')) as {
       results: Array<{ runId: string; status: string }>;
     };
@@ -5186,20 +5310,25 @@ describe('runFailureGet', () => {
       fetchCalls += 1;
       return { body: makeFailureContext() };
     });
-    await expect(
-      runFailureGet(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          testId: 'test_failed',
-          failedOnly: false,
-          out: `/tmp/_p5_no_such_dir_${process.pid}_${Date.now()}/bundle`,
-        },
-        { credentialsPath, fetchImpl },
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-    expect(fetchCalls).toBe(0);
+    const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p5-missing-parent-'));
+    try {
+      await expect(
+        runFailureGet(
+          {
+            profile: 'default',
+            output: 'text',
+            debug: false,
+            testId: 'test_failed',
+            failedOnly: false,
+            out: join(missingParentBase, 'no-such-dir', 'bundle'),
+          },
+          { credentialsPath, fetchImpl },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      expect(fetchCalls).toBe(0);
+    } finally {
+      rmSync(missingParentBase, { recursive: true, force: true });
+    }
   });
 
   it('JSON mode (no --out) prints the wire envelope verbatim to stdout', async () => {
@@ -5980,28 +6109,33 @@ describe('runCreate', () => {
   it('a missing --code-file surfaces VALIDATION_ERROR before any fetch', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn();
-    await expect(
-      runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_alice',
-          type: 'frontend',
-          name: 'n',
-          codeFile: '/tmp/this-file-does-not-exist-xyz123.py',
-        },
-        { credentialsPath, fetchImpl: fetchImpl as never, stdout: () => undefined },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      details: expect.objectContaining({ field: 'code-file' }),
-    });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    const nofileDir = mkdtempSync(join(tmpdir(), 'cli-p2-codefile-nofile-'));
+    try {
+      await expect(
+        runCreate(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            projectId: 'project_alice',
+            type: 'frontend',
+            name: 'n',
+            codeFile: join(nofileDir, 'this-file-does-not-exist.py'),
+          },
+          { credentialsPath, fetchImpl: fetchImpl as never, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: expect.objectContaining({ field: 'code-file' }),
+      });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      rmSync(nofileDir, { recursive: true, force: true });
+    }
   });
 
-  it('rejects a non-Python (.ts) --code-file with VALIDATION_ERROR before any fetch (DEV-232)', async () => {
+  it('rejects a non-Python (.ts) --code-file with VALIDATION_ERROR before any fetch', async () => {
     const { credentialsPath } = makeCreds();
     // The file exists, so this isolates the extension gate (not ENOENT).
     const dir = mkdtempSync(join(tmpdir(), 'cli-p2-ts-'));
@@ -6029,7 +6163,7 @@ describe('runCreate', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('accepts a Python (.py) --code-file (DEV-232)', async () => {
+  it('accepts a Python (.py) --code-file', async () => {
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('import requests\n\n\ndef test_ok():\n    assert True\n');
     const fetchImpl = makeFetch((_url, init) => {
@@ -6052,9 +6186,10 @@ describe('runCreate', () => {
     expect(res).toEqual(SAMPLE_RESPONSE);
   });
 
-  it('rejects a non-Python --code-file even under --dry-run (gate runs before the dry-run branch) (DEV-232)', async () => {
+  it('rejects a non-Python --code-file even under --dry-run (gate runs before the dry-run branch)', async () => {
     // dry-run skips fs, but the extension gate is an up-front input check, so a
     // .ts file is rejected even in dry-run — the preview matches a real run.
+    const dryRunDir = mkdtempSync(join(tmpdir(), 'cli-p2-codefile-dryrun-'));
     await expect(
       runCreate(
         {
@@ -6065,20 +6200,23 @@ describe('runCreate', () => {
           projectId: 'project_alice',
           type: 'backend',
           name: 'n',
-          codeFile: '/tmp/whatever-dry-run.spec.ts',
+          codeFile: join(dryRunDir, 'whatever-dry-run.spec.ts'),
         },
         { stdout: () => undefined, stderr: () => undefined },
       ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      details: expect.objectContaining({ field: 'code-file' }),
-    });
+    )
+      .rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: expect.objectContaining({ field: 'code-file' }),
+      })
+      .finally(() => rmSync(dryRunDir, { recursive: true, force: true }));
   });
 
   it('missing --project surfaces VALIDATION_ERROR (input gate before fs)', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn();
+    const codeFileDir = mkdtempSync(join(tmpdir(), 'cli-p2-codefile-noproject-'));
     await expect(
       runCreate(
         {
@@ -6088,11 +6226,13 @@ describe('runCreate', () => {
           projectId: undefined,
           type: 'frontend',
           name: 'n',
-          codeFile: '/tmp/whatever.txt',
+          codeFile: join(codeFileDir, 'whatever.txt'),
         },
         { credentialsPath, fetchImpl: fetchImpl as never, stdout: () => undefined },
       ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    )
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+      .finally(() => rmSync(codeFileDir, { recursive: true, force: true }));
   });
 
   it('AUTH_FORBIDDEN from the server (read-only key) propagates as exit 3', async () => {
@@ -6198,19 +6338,25 @@ describe('runCreate', () => {
     // Codex round-1 fix: dry-run must work with dummy inputs (no real
     // disk dependency) to match the M2 P6 contract — operators shake
     // out the wire shape without a real test file on hand.
-    const res = await runCreate(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        projectId: 'project_alice',
-        type: 'frontend',
-        name: 'n',
-        codeFile: '/tmp/this-file-does-not-exist-dry-run-xyz.py',
-      },
-      { stdout: () => undefined, stderr: () => undefined },
-    );
+    const dryRunDir = mkdtempSync(join(tmpdir(), 'cli-p2-codefile-dryrun-nofile-'));
+    let res: Awaited<ReturnType<typeof runCreate>>;
+    try {
+      res = await runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: true,
+          projectId: 'project_alice',
+          type: 'frontend',
+          name: 'n',
+          codeFile: join(dryRunDir, 'this-file-does-not-exist-dry-run-xyz.py'),
+        },
+        { stdout: () => undefined, stderr: () => undefined },
+      );
+    } finally {
+      rmSync(dryRunDir, { recursive: true, force: true });
+    }
     expect(res).toMatchObject({ testId: expect.any(String), codeVersion: 'v1' });
   });
 
@@ -6598,6 +6744,34 @@ describe('runCreate', () => {
   });
 
   // Fix 4 — B3: duplicate-name advisory
+  it('does not create a test after the name lookup is interrupted', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('// test code');
+    const interruption = new InterruptError('SIGINT');
+    let postCalled = false;
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') throw interruption;
+      postCalled = true;
+      return { body: SAMPLE_RESPONSE };
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_alice',
+          type: 'frontend',
+          name: 'sign-up happy',
+          codeFile,
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toBe(interruption);
+    expect(postCalled).toBe(false);
+  });
+
   it('Fix 4 — emits advisory on stderr when a test with the same name exists, but still proceeds', async () => {
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('// test code');
@@ -7376,6 +7550,7 @@ describe('runPlanPut', () => {
   it('rejects a missing steps file with VALIDATION_ERROR', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    const nofileDir = mkdtempSync(join(tmpdir(), 'cli-plan-put-nofile-'));
     await expect(
       runPlanPut(
         {
@@ -7383,11 +7558,13 @@ describe('runPlanPut', () => {
           output: 'json',
           debug: false,
           testId: 'test_alpha',
-          stepsFile: '/tmp/does-not-exist-piece6.json',
+          stepsFile: join(nofileDir, 'does-not-exist.json'),
         },
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
       ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    )
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+      .finally(() => rmSync(nofileDir, { recursive: true, force: true }));
   });
 
   it('rejects an empty planSteps array with a field pointer', async () => {
@@ -8058,31 +8235,36 @@ describe('--step-timeout command validation', () => {
   it.each(['0', '-1', '60001', '1.5', 'abc'])(
     'create and update reject %s with the millisecond bounds in VALIDATION_ERROR',
     async raw => {
-      for (const args of [
-        [
-          'create',
-          '--project',
-          'project_alice',
-          '--type',
-          'frontend',
-          '--name',
-          'bounded timeout',
-          '--code-file',
-          '/tmp/not-read-because-validation-runs-first.py',
-          '--step-timeout',
-          raw,
-        ],
-        ['update', 'test_alpha', '--step-timeout', raw],
-      ]) {
-        const test = createTestCommand();
-        disableExits(test);
-        await expect(test.parseAsync(args, { from: 'user' })).rejects.toMatchObject({
-          code: 'VALIDATION_ERROR',
-          details: expect.objectContaining({ field: 'step-timeout' }),
-          nextAction: expect.stringContaining(
-            'must be an integer between 1 and 60000 milliseconds',
-          ),
-        });
+      const notReadDir = mkdtempSync(join(tmpdir(), 'cli-step-timeout-notread-'));
+      try {
+        for (const args of [
+          [
+            'create',
+            '--project',
+            'project_alice',
+            '--type',
+            'frontend',
+            '--name',
+            'bounded timeout',
+            '--code-file',
+            join(notReadDir, 'not-read-because-validation-runs-first.py'),
+            '--step-timeout',
+            raw,
+          ],
+          ['update', 'test_alpha', '--step-timeout', raw],
+        ]) {
+          const test = createTestCommand();
+          disableExits(test);
+          await expect(test.parseAsync(args, { from: 'user' })).rejects.toMatchObject({
+            code: 'VALIDATION_ERROR',
+            details: expect.objectContaining({ field: 'step-timeout' }),
+            nextAction: expect.stringContaining(
+              'must be an integer between 1 and 60000 milliseconds',
+            ),
+          });
+        }
+      } finally {
+        rmSync(notReadDir, { recursive: true, force: true });
       }
     },
   );
@@ -8495,28 +8677,33 @@ describe('runCreateFromPlan', () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn();
     const longKey = 'k'.repeat(253); // 253 + ':run'.length (4) = 257 > 256
-    await expect(
-      runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_alice',
-          type: 'frontend',
-          name: 'n',
-          codeFile: '/tmp/whatever.spec.ts',
-          idempotencyKey: longKey,
-          run: true,
-        },
-        { credentialsPath, fetchImpl: fetchImpl as never, stdout: () => undefined },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      details: expect.objectContaining({ field: 'idempotencyKey' }),
-    });
-    // The create POST must NOT have fired — no orphan test.
-    expect(fetchImpl).not.toHaveBeenCalled();
+    const codeFileDir = mkdtempSync(join(tmpdir(), 'cli-p2-idemkey-'));
+    try {
+      await expect(
+        runCreate(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            projectId: 'project_alice',
+            type: 'frontend',
+            name: 'n',
+            codeFile: join(codeFileDir, 'whatever.spec.ts'),
+            idempotencyKey: longKey,
+            run: true,
+          },
+          { credentialsPath, fetchImpl: fetchImpl as never, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: expect.objectContaining({ field: 'idempotencyKey' }),
+      });
+      // The create POST must NOT have fired — no orphan test.
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      rmSync(codeFileDir, { recursive: true, force: true });
+    }
   });
 
   it('create --run with a 252-char --idempotency-key passes the chain-key guard (boundary: derived == 256)', async () => {
@@ -8527,52 +8714,62 @@ describe('runCreateFromPlan', () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn();
     const boundaryKey = 'k'.repeat(252);
-    await expect(
-      runCreate(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_alice',
-          type: 'frontend',
-          name: 'n',
-          codeFile: '/tmp/this-file-does-not-exist-p2b-boundary.py',
-          idempotencyKey: boundaryKey,
-          run: true,
-        },
-        { credentialsPath, fetchImpl: fetchImpl as never, stdout: () => undefined },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      details: expect.objectContaining({ field: 'code-file' }),
-    });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    const codeFileDir = mkdtempSync(join(tmpdir(), 'cli-p2-idemkey-boundary-'));
+    try {
+      await expect(
+        runCreate(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            projectId: 'project_alice',
+            type: 'frontend',
+            name: 'n',
+            codeFile: join(codeFileDir, 'this-file-does-not-exist-p2b-boundary.py'),
+            idempotencyKey: boundaryKey,
+            run: true,
+          },
+          { credentialsPath, fetchImpl: fetchImpl as never, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: expect.objectContaining({ field: 'code-file' }),
+      });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      rmSync(codeFileDir, { recursive: true, force: true });
+    }
   });
 
   it('create --plan-from --run with a 253-char --idempotency-key fails fast before the create POST (codex #128 P2)', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn();
     const longKey = 'k'.repeat(253);
-    await expect(
-      runCreateFromPlan(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          planFrom: '/tmp/whatever-plan.json',
-          idempotencyKey: longKey,
-          run: true,
-          wait: false,
-        },
-        { credentialsPath, fetchImpl: fetchImpl as never, stdout: () => undefined },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      exitCode: 5,
-      details: expect.objectContaining({ field: 'idempotencyKey' }),
-    });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    const nofileDir = mkdtempSync(join(tmpdir(), 'cli-p2b-nofile-'));
+    try {
+      await expect(
+        runCreateFromPlan(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            planFrom: join(nofileDir, 'whatever-plan.json'),
+            idempotencyKey: longKey,
+            run: true,
+            wait: false,
+          },
+          { credentialsPath, fetchImpl: fetchImpl as never, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: expect.objectContaining({ field: 'idempotencyKey' }),
+      });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      rmSync(nofileDir, { recursive: true, force: true });
+    }
   });
 
   // Per codex round-1 P1: chained `test create --plan-from ... --run`
@@ -8709,59 +8906,71 @@ describe('runCreateFromPlan', () => {
   it('rejects --plan-from --timeout 0 with VALIDATION_ERROR (codex P2)', async () => {
     const test = createTestCommand();
     disableExits(test);
+    const probePlanDir = mkdtempSync(join(tmpdir(), 'cli-p2-timeout-'));
+    const probePlan = join(probePlanDir, 'probe-plan.json');
     await expect(
-      test.parseAsync(
-        ['create', '--plan-from', '/tmp/probe-plan.json', '--run', '--timeout', '0'],
-        { from: 'user' },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      details: expect.objectContaining({ field: 'timeout' }),
-    });
+      test.parseAsync(['create', '--plan-from', probePlan, '--run', '--timeout', '0'], {
+        from: 'user',
+      }),
+    )
+      .rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        details: expect.objectContaining({ field: 'timeout' }),
+      })
+      .finally(() => rmSync(probePlanDir, { recursive: true, force: true }));
   });
 
   it('rejects --plan-from --timeout 1.5 with VALIDATION_ERROR (codex P2)', async () => {
     const test = createTestCommand();
     disableExits(test);
+    const probePlanDir = mkdtempSync(join(tmpdir(), 'cli-p2-timeout-'));
+    const probePlan = join(probePlanDir, 'probe-plan.json');
     await expect(
-      test.parseAsync(
-        ['create', '--plan-from', '/tmp/probe-plan.json', '--run', '--timeout', '1.5'],
-        { from: 'user' },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      details: expect.objectContaining({ field: 'timeout' }),
-    });
+      test.parseAsync(['create', '--plan-from', probePlan, '--run', '--timeout', '1.5'], {
+        from: 'user',
+      }),
+    )
+      .rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        details: expect.objectContaining({ field: 'timeout' }),
+      })
+      .finally(() => rmSync(probePlanDir, { recursive: true, force: true }));
   });
 
   it('rejects --plan-from --timeout 999999 (above cap) with VALIDATION_ERROR (codex P2)', async () => {
     const test = createTestCommand();
     disableExits(test);
+    const probePlanDir = mkdtempSync(join(tmpdir(), 'cli-p2-timeout-'));
+    const probePlan = join(probePlanDir, 'probe-plan.json');
     await expect(
-      test.parseAsync(
-        ['create', '--plan-from', '/tmp/probe-plan.json', '--run', '--timeout', '999999'],
-        { from: 'user' },
-      ),
-    ).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      details: expect.objectContaining({ field: 'timeout' }),
-    });
+      test.parseAsync(['create', '--plan-from', probePlan, '--run', '--timeout', '999999'], {
+        from: 'user',
+      }),
+    )
+      .rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        details: expect.objectContaining({ field: 'timeout' }),
+      })
+      .finally(() => rmSync(probePlanDir, { recursive: true, force: true }));
   });
 
   it('rejects a missing plan file with VALIDATION_ERROR', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    const nofileDir = mkdtempSync(join(tmpdir(), 'cli-create-from-plan-nofile-'));
     await expect(
       runCreateFromPlan(
         {
           profile: 'default',
           output: 'json',
           debug: false,
-          planFrom: '/tmp/does-not-exist-piece5.json',
+          planFrom: join(nofileDir, 'does-not-exist.json'),
         },
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
       ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    )
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+      .finally(() => rmSync(nofileDir, { recursive: true, force: true }));
   });
 
   it('rejects a plan missing required fields with a typed field pointer', async () => {
@@ -9877,6 +10086,461 @@ describe('runCreateBatch', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Shared capped-file guard — --steps / --plan-from / --plans each open their
+// file exactly once and size-check + read it through that same descriptor
+// (rather than a separate stat call followed by a separate read against the
+// path string), so a file swapped in between the two operations cannot
+// bypass the size cap or substitute its content. Covers all five outcomes
+// for each of the three flags: missing file, directory path, oversized
+// file, unreadable file, and the happy path.
+// ---------------------------------------------------------------------------
+
+describe('capped-file guard: --steps / --plan-from / --plans open once, then size-check and read via the same fd', () => {
+  const tempDirs: string[] = [];
+  function mkTempDir(prefix: string): string {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    tempDirs.push(dir);
+    return dir;
+  }
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (!dir) continue;
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Best-effort cleanup — each permission test restores its own
+        // file's mode in a `finally` before this runs, so this only
+        // guards against an already-failed test leaving a locked file.
+      }
+    }
+  });
+
+  const STEPS_BODY = { planSteps: [{ type: 'action', description: 'navigate to /login' }] };
+  const FE_PLAN_BODY = {
+    projectId: 'project_alice',
+    type: 'frontend' as const,
+    name: 'guard coverage',
+    planSteps: [{ type: 'action', description: 'navigate to /login' }],
+  };
+  const FE_SPEC_BODY = {
+    projectId: 'project_alice',
+    type: 'frontend' as const,
+    name: 'guard coverage',
+    planSteps: [{ type: 'action', description: 'navigate' }],
+  };
+
+  describe('--steps (test plan put)', () => {
+    it('a missing file reports VALIDATION_ERROR "file does not exist"', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-steps-enoent-');
+      const missing = join(dir, 'nope.json');
+      await expect(
+        runPlanPut(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            testId: 'test_x',
+            stepsFile: missing,
+          },
+          { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        nextAction: expect.stringContaining('file does not exist'),
+      });
+    });
+
+    it('a directory path reports VALIDATION_ERROR "cannot read" on every platform', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-steps-dir-');
+      await expect(
+        runPlanPut(
+          { profile: 'default', output: 'json', debug: false, testId: 'test_x', stepsFile: dir },
+          { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        nextAction: expect.stringContaining('cannot read'),
+      });
+    });
+
+    it.skipIf(process.platform === 'win32')(
+      'a pipe that streams past the cap reports PAYLOAD_TOO_LARGE even though fstat says 0 bytes (POSIX only — needs mkfifo)',
+      async () => {
+        const { credentialsPath } = makeCreds();
+        const dir = mkTempDir('cli-guard-steps-fifo-');
+        const fifo = join(dir, 'steps.fifo');
+        execFileSync('mkfifo', [fifo]);
+        // The writer is its own process, so the reader's blocking open and
+        // reads can make progress; it gets SIGPIPE once the reader stops.
+        const writer = spawn('sh', ['-c', 'head -c 400000 /dev/zero > "$0"', fifo], {
+          stdio: 'ignore',
+        });
+        try {
+          await expect(
+            runPlanPut(
+              {
+                profile: 'default',
+                output: 'json',
+                debug: false,
+                testId: 'test_x',
+                stepsFile: fifo,
+              },
+              { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+            ),
+          ).rejects.toMatchObject({
+            code: 'PAYLOAD_TOO_LARGE',
+            details: { field: 'steps', maxBytes: 256 * 1024 },
+          });
+        } finally {
+          writer.kill();
+        }
+      },
+    );
+
+    it('an oversized file reports PAYLOAD_TOO_LARGE with the 256 KB steps cap', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-steps-big-');
+      const file = join(dir, 'big.json');
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+      writeFileSync(file, 'x'.repeat(300 * 1024), 'utf8');
+      await expect(
+        runPlanPut(
+          { profile: 'default', output: 'json', debug: false, testId: 'test_x', stepsFile: file },
+          { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'PAYLOAD_TOO_LARGE',
+        message: expect.stringContaining('256 KB'),
+        details: { field: 'steps', maxBytes: 256 * 1024 },
+      });
+    });
+
+    it.skipIf(process.platform === 'win32')(
+      'an unreadable file reports VALIDATION_ERROR "permission denied" (POSIX only — chmod is not meaningful on Windows)',
+      async () => {
+        const { credentialsPath } = makeCreds();
+        const dir = mkTempDir('cli-guard-steps-perm-');
+        const file = join(dir, 'locked.json');
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+        writeFileSync(file, JSON.stringify(STEPS_BODY), 'utf8');
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+        chmodSync(file, 0o000);
+        try {
+          await expect(
+            runPlanPut(
+              {
+                profile: 'default',
+                output: 'json',
+                debug: false,
+                testId: 'test_x',
+                stepsFile: file,
+              },
+              { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+            ),
+          ).rejects.toMatchObject({
+            code: 'VALIDATION_ERROR',
+            // A file made unreadable by its own mode bits (not a parent
+            // directory access restriction) reaches this exact wording in
+            // the pre-fd-based code too: stat() only needs directory
+            // search permission, so it passed stat and failed only at the
+            // read, landing in the generic "cannot read ...: EACCES: ..."
+            // message rather than the dedicated "permission denied
+            // reading ..." wording reserved for a stat()-time EACCES.
+            nextAction: expect.stringMatching(
+              /^Flag `--[\w-]+` is invalid: cannot read .*EACCES.*\.$/,
+            ),
+          });
+        } finally {
+          // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+          chmodSync(file, 0o600);
+        }
+      },
+    );
+
+    it.skipIf(process.platform === 'win32')(
+      'a directory the process cannot even traverse into reports the dedicated "permission denied reading" wording (POSIX only)',
+      async () => {
+        const { credentialsPath } = makeCreds();
+        const dir = mkTempDir('cli-guard-steps-noaccess-');
+        const lockedDir = join(dir, 'locked');
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+        mkdirSync(lockedDir);
+        const file = join(lockedDir, 'steps.json');
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+        writeFileSync(file, JSON.stringify(STEPS_BODY), 'utf8');
+        // Denying search (execute) permission on the CONTAINING directory
+        // makes `open()` on `file` fail with EACCES before the kernel ever
+        // resolves the file itself — the one case the old stat()-first code
+        // also failed AT STAT, hence its dedicated "permission denied
+        // reading" wording. This is different from the sibling test above,
+        // which chmods the FILE (so its directory is still traversable and
+        // only the final open of the file itself is denied).
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+        chmodSync(lockedDir, 0o000);
+        try {
+          await expect(
+            runPlanPut(
+              {
+                profile: 'default',
+                output: 'json',
+                debug: false,
+                testId: 'test_x',
+                stepsFile: file,
+              },
+              { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+            ),
+          ).rejects.toMatchObject({
+            code: 'VALIDATION_ERROR',
+            nextAction: expect.stringContaining(`permission denied reading ${file}`),
+          });
+        } finally {
+          // Restore search permission before this suite's afterEach tries
+          // to rmSync(dir, { recursive: true }) — it cannot descend into
+          // `locked/` to remove `steps.json` (or `locked/` itself) while
+          // this is still 0o000.
+          // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+          chmodSync(lockedDir, 0o700);
+        }
+      },
+    );
+
+    it('a valid steps file is read once and PUT through', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-steps-ok-');
+      const file = join(dir, 'steps.json');
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+      writeFileSync(file, JSON.stringify(STEPS_BODY), 'utf8');
+      const fetchImpl = makeFetch(() => ({
+        body: {
+          testId: 'test_x',
+          planStepsHash: 'sha256:guard',
+          stepCount: 1,
+          updatedAt: '2026-05-14T10:00:00.000Z',
+        },
+      }));
+      const res = await runPlanPut(
+        { profile: 'default', output: 'json', debug: false, testId: 'test_x', stepsFile: file },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      );
+      expect(res.stepCount).toBe(1);
+    });
+  });
+
+  describe('--plan-from (test create-from-plan)', () => {
+    it('a missing file reports VALIDATION_ERROR "file does not exist"', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-plan-enoent-');
+      const missing = join(dir, 'nope.json');
+      await expect(
+        runCreateFromPlan(
+          { profile: 'default', output: 'json', debug: false, planFrom: missing },
+          { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        nextAction: expect.stringContaining('file does not exist'),
+      });
+    });
+
+    it('a directory path reports VALIDATION_ERROR "cannot read" on every platform', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-plan-dir-');
+      await expect(
+        runCreateFromPlan(
+          { profile: 'default', output: 'json', debug: false, planFrom: dir },
+          { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        nextAction: expect.stringContaining('cannot read'),
+      });
+    });
+
+    it('an oversized file reports PAYLOAD_TOO_LARGE with the 256 KB plan-from cap', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-plan-big-');
+      const file = join(dir, 'big.json');
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+      writeFileSync(file, 'x'.repeat(300 * 1024), 'utf8');
+      await expect(
+        runCreateFromPlan(
+          { profile: 'default', output: 'json', debug: false, planFrom: file },
+          { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'PAYLOAD_TOO_LARGE',
+        message: expect.stringContaining('256 KB'),
+        details: { field: 'plan-from', maxBytes: 256 * 1024 },
+      });
+    });
+
+    it.skipIf(process.platform === 'win32')(
+      'an unreadable file reports VALIDATION_ERROR "permission denied" (POSIX only — chmod is not meaningful on Windows)',
+      async () => {
+        const { credentialsPath } = makeCreds();
+        const dir = mkTempDir('cli-guard-plan-perm-');
+        const file = join(dir, 'locked.json');
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+        writeFileSync(file, JSON.stringify(FE_PLAN_BODY), 'utf8');
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+        chmodSync(file, 0o000);
+        try {
+          await expect(
+            runCreateFromPlan(
+              { profile: 'default', output: 'json', debug: false, planFrom: file },
+              { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+            ),
+          ).rejects.toMatchObject({
+            code: 'VALIDATION_ERROR',
+            // A file made unreadable by its own mode bits (not a parent
+            // directory access restriction) reaches this exact wording in
+            // the pre-fd-based code too: stat() only needs directory
+            // search permission, so it passed stat and failed only at the
+            // read, landing in the generic "cannot read ...: EACCES: ..."
+            // message rather than the dedicated "permission denied
+            // reading ..." wording reserved for a stat()-time EACCES.
+            nextAction: expect.stringMatching(
+              /^Flag `--[\w-]+` is invalid: cannot read .*EACCES.*\.$/,
+            ),
+          });
+        } finally {
+          // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+          chmodSync(file, 0o600);
+        }
+      },
+    );
+
+    it('a valid plan file is read once and POSTed through', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-plan-ok-');
+      const file = join(dir, 'plan.json');
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+      writeFileSync(file, JSON.stringify(FE_PLAN_BODY), 'utf8');
+      const fetchImpl = makeFetch(() => ({
+        body: {
+          testId: 'test_guard',
+          type: 'frontend' as const,
+          codeVersion: 'v1',
+          createdAt: '2026-05-14T10:00:00.000Z',
+        },
+      }));
+      const res = await runCreateFromPlan(
+        { profile: 'default', output: 'json', debug: false, planFrom: file },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      );
+      expect(res.testId).toBe('test_guard');
+    });
+  });
+
+  describe('--plans (test create-batch)', () => {
+    it('a missing file reports VALIDATION_ERROR "file does not exist"', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-batch-enoent-');
+      const missing = join(dir, 'nope.jsonl');
+      await expect(
+        runCreateBatch(
+          { profile: 'default', output: 'json', debug: false, plans: missing },
+          { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        nextAction: expect.stringContaining('file does not exist'),
+      });
+    });
+
+    it('a directory path reports VALIDATION_ERROR "cannot read" on every platform', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-batch-dir-');
+      await expect(
+        runCreateBatch(
+          { profile: 'default', output: 'json', debug: false, plans: dir },
+          { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        nextAction: expect.stringContaining('cannot read'),
+      });
+    });
+
+    it('an oversized file reports PAYLOAD_TOO_LARGE with the 5 MB plans cap', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-batch-big-');
+      const file = join(dir, 'big.jsonl');
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+      writeFileSync(file, 'x'.repeat(5 * 1024 * 1024 + 1024), 'utf8');
+      await expect(
+        runCreateBatch(
+          { profile: 'default', output: 'json', debug: false, plans: file },
+          { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'PAYLOAD_TOO_LARGE',
+        message: expect.stringContaining('5 MB'),
+        details: { field: 'plans', maxBytes: 5 * 1024 * 1024 },
+      });
+    });
+
+    it.skipIf(process.platform === 'win32')(
+      'an unreadable file reports VALIDATION_ERROR "permission denied" (POSIX only — chmod is not meaningful on Windows)',
+      async () => {
+        const { credentialsPath } = makeCreds();
+        const dir = mkTempDir('cli-guard-batch-perm-');
+        const file = join(dir, 'locked.jsonl');
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+        writeFileSync(file, `${JSON.stringify(FE_SPEC_BODY)}\n`, 'utf8');
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+        chmodSync(file, 0o000);
+        try {
+          await expect(
+            runCreateBatch(
+              { profile: 'default', output: 'json', debug: false, plans: file },
+              { credentialsPath, stdout: () => undefined, stderr: () => undefined },
+            ),
+          ).rejects.toMatchObject({
+            code: 'VALIDATION_ERROR',
+            // A file made unreadable by its own mode bits (not a parent
+            // directory access restriction) reaches this exact wording in
+            // the pre-fd-based code too: stat() only needs directory
+            // search permission, so it passed stat and failed only at the
+            // read, landing in the generic "cannot read ...: EACCES: ..."
+            // message rather than the dedicated "permission denied
+            // reading ..." wording reserved for a stat()-time EACCES.
+            nextAction: expect.stringMatching(
+              /^Flag `--[\w-]+` is invalid: cannot read .*EACCES.*\.$/,
+            ),
+          });
+        } finally {
+          // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+          chmodSync(file, 0o600);
+        }
+      },
+    );
+
+    it('a valid plans file is read once and POSTed through', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkTempDir('cli-guard-batch-ok-');
+      const file = join(dir, 'plans.jsonl');
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture path inside this test's own mkdtempSync() dir, never user input.
+      writeFileSync(file, `${JSON.stringify(FE_SPEC_BODY)}\n`, 'utf8');
+      const fetchImpl = makeFetch(() => ({
+        body: {
+          results: [{ specIndex: 0, testId: 'test_guard', status: 'created' as const }],
+          summary: { total: 1, created: 1, failed: 0 },
+        },
+      }));
+      const res = await runCreateBatch(
+        { profile: 'default', output: 'json', debug: false, plans: file },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      );
+      expect(res.summary.created).toBe(1);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Finding 1 — timeoutIsDefault in create-chain paths (codex round-2)
 // ---------------------------------------------------------------------------
 // Confirm that the first-run timeout hint fires (or doesn't) correctly when
@@ -10533,12 +11197,12 @@ describe('Fix 5 — dashboardUrl emission', () => {
 });
 
 // ---------------------------------------------------------------------------
-// DEV-737 — server-provided dashboardUrl precedence on create paths
+// Server-provided dashboardUrl precedence on create paths
 // ---------------------------------------------------------------------------
 
-describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () => {
-  function writeCodeFileDev737(contents: string): string {
-    const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-'));
+describe('create paths prefer a server-provided dashboardUrl', () => {
+  function writeDashboardUrlCodeFile(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-dashboard-url-'));
     const path = join(dir, 'test.py');
     writeFileSync(path, contents, 'utf8');
     return path;
@@ -10546,7 +11210,7 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
 
   it('runCreate JSON: a server-provided dashboardUrl wins over the client V2 guess', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const codeFile = writeDashboardUrlCodeFile('test("dash", async () => {});');
     const serverUrl =
       'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_dash/test-cases/test_dash_01';
     const fetchImpl = makeFetch((_url, init) => {
@@ -10587,7 +11251,7 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
     // response that OMITS the key entirely (not merely nullish) must be
     // treated as "backend predates this field", never as suppression.
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const codeFile = writeDashboardUrlCodeFile('test("dash", async () => {});');
     const fetchImpl = makeFetch((_url, init) => {
       if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
       return {
@@ -10631,7 +11295,7 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
 
   it('runCreate JSON: server dashboardUrl:null suppresses the link — no client guess, and an advisory fires', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const codeFile = writeDashboardUrlCodeFile('test("dash", async () => {});');
     const fetchImpl = makeFetch((_url, init) => {
       if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
       return {
@@ -10674,7 +11338,7 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
 
   it('runCreate text mode: suppressed link — no dead Dashboard: line, advisory still fires on stderr', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const codeFile = writeDashboardUrlCodeFile('test("dash", async () => {});');
     const fetchImpl = makeFetch((_url, init) => {
       if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
       return {
@@ -10714,7 +11378,7 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
 
   it('runCreate --run chain: suppressed server link is not replaced by the client guess', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const codeFile = writeDashboardUrlCodeFile('test("dash", async () => {});');
     const fetchImpl = makeFetch((url, init) => {
       const method = init.method ?? 'GET';
       if (method === 'GET' && url.includes('/tests?')) return { status: 200, body: { items: [] } };
@@ -10773,14 +11437,14 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
   });
 
   it('runCreateFromPlan JSON: a server-provided dashboardUrl wins over the plan-derived client guess', async () => {
-    function writePlanFileDev737(plan: unknown): string {
-      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-plan-'));
+    function writeDashboardUrlPlanFile(plan: unknown): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dashboard-url-plan-'));
       const path = join(dir, 'plan.json');
       writeFileSync(path, JSON.stringify(plan), 'utf8');
       return path;
     }
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const planFile = writePlanFileDev737({
+    const planFile = writeDashboardUrlPlanFile({
       projectId: 'proj_dash_plan',
       type: 'frontend',
       name: 'dash plan test',
@@ -10811,14 +11475,14 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
   });
 
   it('runCreateFromPlan JSON: server dashboardUrl:null suppresses the link — no plan-derived client guess', async () => {
-    function writePlanFileDev737(plan: unknown): string {
-      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-plan-'));
+    function writeDashboardUrlPlanFile(plan: unknown): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dashboard-url-plan-'));
       const path = join(dir, 'plan.json');
       writeFileSync(path, JSON.stringify(plan), 'utf8');
       return path;
     }
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const planFile = writePlanFileDev737({
+    const planFile = writeDashboardUrlPlanFile({
       projectId: 'proj_dash_plan',
       type: 'frontend',
       name: 'dash plan test',
@@ -10856,14 +11520,14 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
   });
 
   it('runCreateFromPlan JSON: server dashboardUrl absent (backend predates this field) — falls back to the plan-derived client guess', async () => {
-    function writePlanFileDev737(plan: unknown): string {
-      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-plan-'));
+    function writeDashboardUrlPlanFile(plan: unknown): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dashboard-url-plan-'));
       const path = join(dir, 'plan.json');
       writeFileSync(path, JSON.stringify(plan), 'utf8');
       return path;
     }
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const planFile = writePlanFileDev737({
+    const planFile = writeDashboardUrlPlanFile({
       projectId: 'proj_dash_plan',
       type: 'frontend',
       name: 'dash plan test',
@@ -10903,8 +11567,8 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
   });
 
   it('runCreateBatch JSON: per-item server dashboardUrl wins/suppresses independently; one aggregate advisory', async () => {
-    function writePlansJsonlDev737(plans: unknown[]): string {
-      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-batch-'));
+    function writeDashboardUrlPlansJsonl(plans: unknown[]): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dashboard-url-batch-'));
       const path = join(dir, 'plans.jsonl');
       writeFileSync(path, plans.map(p => JSON.stringify(p)).join('\n') + '\n', 'utf8');
       return path;
@@ -10921,7 +11585,7 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
       name: 'batch spec b',
       planSteps: [{ type: 'action', description: 'navigate' }],
     };
-    const plansFile = writePlansJsonlDev737([specA, specB]);
+    const plansFile = writeDashboardUrlPlansJsonl([specA, specB]);
     const serverUrlA =
       'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_batch_a/test-cases/test_a';
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
@@ -10968,8 +11632,8 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
   // client-side URL from testId→projectId. Covers both `--output json`
   // (the field is directly assertable) and `--output text` (asserts no
   // legacy URL leaks anywhere and the batch-run summary still renders).
-  function writeTwoSpecPlansDev737(): string {
-    const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-batch-run-'));
+  function writeTwoSpecDashboardUrlPlans(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-dashboard-url-batch-run-'));
     const path = join(dir, 'plans.jsonl');
     const specA = {
       projectId: 'proj_run_a',
@@ -11028,7 +11692,7 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
 
   it('runCreateBatch --run --output json: per-item run results reuse the create-time server dashboardUrl/suppression — not a client-side recompute', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const plansFile = writeTwoSpecPlansDev737();
+    const plansFile = writeTwoSpecDashboardUrlPlans();
     const out: string[] = [];
     await runCreateBatch(
       {
@@ -11065,7 +11729,7 @@ describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () =>
 
   it('runCreateBatch --run --output text: no legacy dashboard link leaks anywhere; batch-run summary still prints', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
-    const plansFile = writeTwoSpecPlansDev737();
+    const plansFile = writeTwoSpecDashboardUrlPlans();
     const stdoutLines: string[] = [];
     const stderrLines: string[] = [];
     await runCreateBatch(

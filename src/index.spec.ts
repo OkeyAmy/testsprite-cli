@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as InterruptModule from './lib/interrupt.js';
 
@@ -7,6 +10,9 @@ vi.mock('./lib/interrupt.js', async importOriginal => ({
   ...(await importOriginal<typeof InterruptModule>()),
   installSignalHandlers: vi.fn(),
   installBrokenPipeGuard: vi.fn(),
+  // The real backstop arms a process-wide exit timer that would fire into
+  // later tests on a slow runner; the test that covers it opts back in.
+  armInterruptExitBackstop: vi.fn(),
 }));
 vi.mock('./lib/proxy.js', () => ({
   maybeInstallProxyAgent: vi.fn(),
@@ -44,7 +50,12 @@ beforeEach(() => {
   vi.stubEnv('TESTSPRITE_NO_TELEMETRY', '1');
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // The backstop is normally a mock in this in-process CLI suite. Reset the
+  // one test's real implementation before another invocation can arm it.
+  const { armInterruptExitBackstop } = await import('./lib/interrupt.js');
+  vi.mocked(armInterruptExitBackstop).mockReset();
+  vi.clearAllTimers();
   process.argv = originalArgv;
   process.exitCode = originalExitCode;
   vi.restoreAllMocks();
@@ -52,6 +63,169 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
+
+it('gives disarmed requests generic recovery guidance', async () => {
+  const { globalShutdown } = await import('./lib/interrupt.js');
+  const { InterruptError } = await import('./lib/errors.js');
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      expect(globalShutdown.isArmed).toBe(false);
+      throw new InterruptError('SIGINT');
+    }),
+  );
+  process.argv = ['node', 'testsprite', 'auth', 'whoami', '--output', 'json'];
+  await import('./index.js');
+  expect(process.exitCode).toBe(130);
+  const error = (
+    JSON.parse(stderr.slice(stderr.indexOf('{'))) as {
+      error: { code: string; nextAction: string; details: Record<string, unknown> };
+    }
+  ).error;
+  expect(error.code).toBe('INTERRUPTED');
+  expect(error.nextAction).toBe(
+    'The request was interrupted. Check the current state before retrying; ' +
+      'a multi-item command may have processed some items.',
+  );
+  expect(stdout).toBe('');
+});
+
+it('bounds a stranded interrupt after rendering its error', async () => {
+  vi.useFakeTimers();
+  const exit = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+  const actual = await vi.importActual<typeof InterruptModule>('./lib/interrupt.js');
+  const { armInterruptExitBackstop } = await import('./lib/interrupt.js');
+  vi.mocked(armInterruptExitBackstop).mockImplementation(actual.armInterruptExitBackstop);
+  const { InterruptError } = await import('./lib/errors.js');
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      throw new InterruptError('SIGINT');
+    }),
+  );
+  process.argv = ['node', 'testsprite', 'auth', 'whoami'];
+  await import('./index.js');
+
+  expect(stderr).toContain('Error: Interrupted by SIGINT.');
+  expect(process.exitCode).toBe(130);
+  expect(exit).not.toHaveBeenCalled();
+  expect(vi.getTimerCount()).toBe(1);
+  await vi.advanceTimersByTimeAsync(3_000);
+  expect(exit).toHaveBeenCalledOnce();
+  expect(exit).toHaveBeenCalledWith(130);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it('disarms a pending hard-exit timer when the test scope ends', async () => {
+  vi.useFakeTimers();
+  const exit = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+  const actual = await vi.importActual<typeof InterruptModule>('./lib/interrupt.js');
+  const { armInterruptExitBackstop } = await import('./lib/interrupt.js');
+  vi.mocked(armInterruptExitBackstop).mockImplementation(actual.armInterruptExitBackstop);
+  const { InterruptError } = await import('./lib/errors.js');
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      throw new InterruptError('SIGINT');
+    }),
+  );
+  process.argv = ['node', 'testsprite', 'auth', 'whoami'];
+  await import('./index.js');
+
+  expect(process.exitCode).toBe(130);
+  expect(vi.getTimerCount()).toBe(1);
+  vi.clearAllTimers();
+  expect(vi.getTimerCount()).toBe(0);
+  await vi.advanceTimersByTimeAsync(3_000);
+  expect(exit).not.toHaveBeenCalled();
+});
+
+it.each(['create-batch', 'rerun'] as const)(
+  'renders run recovery guidance for an interrupted %s fan-out',
+  async command => {
+    const { InterruptError } = await import('./lib/errors.js');
+    const interruption = new InterruptError('SIGINT');
+    const plansFile = join(mkdtempSync(join(tmpdir(), 'cli-index-interrupt-')), 'plans.jsonl');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture path built from this test's own mkdtempSync() dir, never user input
+    writeFileSync(
+      plansFile,
+      JSON.stringify({
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'spec-one',
+        planSteps: [{ type: 'action', description: 'navigate to home' }],
+      }) + '\n',
+    );
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+        const url = String(input);
+        if (url.endsWith('/tests/batch/rerun')) {
+          return new Response(
+            JSON.stringify({
+              accepted: [
+                { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+                { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+              ],
+              deferred: [],
+              conflicts: [],
+              closure: { byProject: [] },
+            }),
+            { status: 202 },
+          );
+        }
+        if (url.endsWith('/tests/batch')) {
+          return new Response(
+            JSON.stringify({
+              results: [{ specIndex: 0, testId: 'test_1', status: 'created' }],
+              summary: { total: 1, created: 1, failed: 0 },
+            }),
+          );
+        }
+        if (url.endsWith('/tests/test_1/runs')) {
+          return new Response(
+            JSON.stringify({
+              runId: 'run_b1',
+              status: 'queued',
+              enqueuedAt: '2026-06-03T10:00:00.000Z',
+              codeVersion: 'v1',
+              targetUrl: '',
+            }),
+          );
+        }
+        throw interruption;
+      }),
+    );
+    process.argv =
+      command === 'create-batch'
+        ? [
+            'node',
+            'testsprite',
+            'test',
+            'create-batch',
+            '--plans',
+            plansFile,
+            '--run',
+            '--wait',
+            '--output',
+            'json',
+          ]
+        : ['node', 'testsprite', 'test', 'rerun', 'test_1', 'test_2', '--wait', '--output', 'json'];
+    await import('./index.js');
+
+    expect(process.exitCode).toBe(130);
+    expect(stdout).toContain('run_b1');
+    const envelope = JSON.parse(stderr.slice(stderr.lastIndexOf('{\n  "error"'))) as {
+      error: { code: string; nextAction: string };
+    };
+    expect(envelope.error.code).toBe('INTERRUPTED');
+    expect(envelope.error.nextAction).toBe(
+      'The server-side run (if any) keeps executing and billing. ' +
+        'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
+        '(runId is in the partial JSON on stdout).',
+    );
+  },
+);
 
 const LOCAL_UNSUPPORTED_MESSAGE =
   '--local only supports frontend tests today. Re-run without --local, or point the test at a reachable base URL.';

@@ -290,7 +290,7 @@ const SKIP_HINT = 'Skip this check with --skip-preflight.';
 /**
  * Run {@link probeLocalPort} and either throw (refuse) or no-op (ok / skipped).
  *
- * Call this BEFORE minting a tunnel. That ordering is the feature: DEV-243
+ * Call this BEFORE minting a tunnel. That ordering is the feature: telemetry
  * measured 1,003 blocked-with-URL CLI runs, 55.5% of the third-party-tunnel
  * ones blocked, every one of them charged, because the run row and its credit
  * spend happen before the Lambda ever discovers the target is dead. A dev

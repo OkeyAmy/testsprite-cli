@@ -9,6 +9,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   renderAmbiguousOrgCandidates,
+  renderTunnelBindingLimitIds,
   renderCommanderError,
   rephraseUnknownOption,
 } from './render-error.js';
@@ -102,6 +103,33 @@ describe('rephraseUnknownOption', () => {
     const result = rephraseUnknownOption("error: unknown option '--request-timeout'");
     expect(result).not.toBeNull();
     expect(result).toContain('testsprite --request-timeout <value> <subcommand>');
+  });
+});
+
+describe('renderTunnelBindingLimitIds', () => {
+  it('renders valid ids and a recovery hint, skipping non-string entries', () => {
+    expect(renderTunnelBindingLimitIds(['id-one', null, 7, 'id-two'])).toEqual([
+      '  tunnel: id-one',
+      '  tunnel: id-two',
+      '  hint: testsprite tunnel list · testsprite tunnel stop <client-id> · testsprite tunnel stop --all --confirm',
+    ]);
+  });
+
+  it('returns no decoration for malformed or empty details', () => {
+    for (const value of [undefined, null, {}, 'id-one', [], [null, 7]]) {
+      expect(renderTunnelBindingLimitIds(value)).toEqual([]);
+    }
+  });
+
+  it('caps rendered ids at 20 and counts the remaining valid ids', () => {
+    const lines = renderTunnelBindingLimitIds([
+      ...Array.from({ length: 22 }, (_, i) => `id-${i}`),
+      null,
+    ]);
+    expect(lines).toHaveLength(22);
+    expect(lines[19]).toBe('  tunnel: id-19');
+    expect(lines[20]).toBe('  … and 2 more');
+    expect(lines[21]).toContain('testsprite tunnel list');
   });
 });
 

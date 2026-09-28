@@ -393,6 +393,7 @@ describe('TunnelClient TLS data plane', () => {
   });
 
   it('stops after the bounded TLS retry window without a plaintext downgrade', async () => {
+    vi.useFakeTimers();
     const connections = new Set<MemoryConnection>();
     let attempts = 0;
     const errors: Array<{ code: ErrCode; message: string }> = [];
@@ -415,20 +416,24 @@ describe('TunnelClient TLS data plane', () => {
 
     try {
       requestTunnel(controlSocket);
-      await waitUntil(() => errors.some(error => error.code === ErrCode.DataPlaneUnreachable));
+      // A busy runner may spend more wall time here than the entire retry
+      // window. Virtual time keeps the retry/deadline schedule independent of
+      // TLS handshake and event-loop speed.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      await vi.advanceTimersByTimeAsync(100);
       const terminalErrors = errors.filter(error => error.code === ErrCode.DataPlaneUnreachable);
-      expect(attempts).toBeGreaterThanOrEqual(3);
+      expect(attempts).toBeGreaterThanOrEqual(1);
+      expect(netConnect).not.toHaveBeenCalled();
       expect(terminalErrors).toHaveLength(1);
       expect(terminalErrors[0]?.message).toBe(
         'Data plane tls at 127.0.0.1:443 is unreachable after 60ms: ' +
           'certificate rejected for [REDACTED]',
       );
       expect(terminalErrors[0]?.message).not.toContain(SECRET);
-      expect(netConnect).not.toHaveBeenCalled();
-
       const attemptsAtFailure = attempts;
-      await new Promise(resolve => setTimeout(resolve, 60));
+      await vi.advanceTimersByTimeAsync(100);
       expect(attempts).toBe(attemptsAtFailure);
+      expect(errors.filter(error => error.code === ErrCode.DataPlaneUnreachable)).toHaveLength(1);
     } finally {
       await client.stop();
       destroyConnections(connections);

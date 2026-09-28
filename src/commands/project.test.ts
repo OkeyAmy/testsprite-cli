@@ -1,7 +1,7 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../lib/errors.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import {
@@ -570,7 +570,7 @@ describe('runGet — org attribution', () => {
   });
 });
 
-describe('DEV-244 — project update no longer accepts the dead --description flag', () => {
+describe('project update no longer accepts the dead --description flag', () => {
   it('rejects --description on `project update` as an unknown option', async () => {
     const project = createProjectCommand();
     const update = project.commands.find(c => c.name() === 'update')!;
@@ -941,7 +941,7 @@ describe('runCreate', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(result.type).toBe('frontend');
     expect(result.name).toBe('DryRun Project');
-    // DEV-247: the canned sample must carry the "not from the server" banner.
+    // The canned sample must carry the "not from the server" banner.
     expect(err).toContain(DRY_RUN_BANNER);
   });
 
@@ -1576,7 +1576,7 @@ describe('runUpdate', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(result.id).toBe('proj_dry');
     expect(result.updatedFields).toContain('name');
-    // DEV-247: the canned sample must carry the "not from the server" banner.
+    // The canned sample must carry the "not from the server" banner.
     expect(err).toContain(DRY_RUN_BANNER);
   });
 
@@ -1585,22 +1585,28 @@ describe('runUpdate', () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error('should not hit network');
     });
-    const result = await runUpdate(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        projectId: 'proj_dry',
-        passwordFile: '/tmp/definitely-not-here-testsprite',
-      },
-      {
-        credentialsPath,
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        stdout: () => {},
-        stderr: () => {},
-      },
-    );
+    const nofileDir = mkdtempSync(join(tmpdir(), 'cli-p2-nofile-'));
+    let result: Awaited<ReturnType<typeof runUpdate>>;
+    try {
+      result = await runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: true,
+          projectId: 'proj_dry',
+          passwordFile: join(nofileDir, 'definitely-not-here-testsprite'),
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      );
+    } finally {
+      rmSync(nofileDir, { recursive: true, force: true });
+    }
 
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(result.id).toBe('proj_dry');
@@ -1760,7 +1766,11 @@ describe('runUpdate', () => {
 });
 
 describe('#79 — an unreadable --password-file is a validation error, not a crash', () => {
-  const missing = join(tmpdir(), 'testsprite-issue-79-absent-password-file');
+  const missingDir = mkdtempSync(join(tmpdir(), 'cli-p79-nofile-'));
+  const missing = join(missingDir, 'testsprite-issue-79-absent-password-file');
+  afterAll(() => {
+    rmSync(missingDir, { recursive: true, force: true });
+  });
 
   it('runCreate rejects a missing file with VALIDATION_ERROR (exit 5) before the network', async () => {
     const { credentialsPath } = makeCreds();

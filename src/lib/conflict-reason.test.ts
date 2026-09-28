@@ -5,6 +5,8 @@ import {
   everyConflictIs,
   insufficientCreditsConflictError,
   isAllCreditsRefusal,
+  isPausedRefusal,
+  pausedConflictError,
   summarizeConflicts,
 } from './conflict-reason.js';
 import { ApiError } from './errors.js';
@@ -75,7 +77,8 @@ describe('billing conflict reasons', () => {
     expect(
       describeConflict({ testId: 't', reason: 'insufficient_credits', message: 'Need 2 more.' }),
     ).toBe('Need 2 more.');
-    expect(describeConflict({ testId: 't', reason: 'billing_hold' })).toBe('billing hold');
+    expect(describeConflict({ testId: 't', reason: 'billing_hold' })).toBe('workspace paused');
+    expect(describeConflict({ testId: 't', reason: 'paused' })).toBe('workspace paused');
     expect(
       describeConflict({ testId: 't', reason: 'billing_hold', message: 'Card declined.' }),
     ).toBe('Card declined.');
@@ -87,7 +90,7 @@ describe('billing conflict reasons', () => {
       { testId: 'b', reason: 'billing_hold' },
       { testId: 'c' },
     ]);
-    expect(summary).toBe('1 insufficient credits, 1 billing hold, 1 already in flight');
+    expect(summary).toBe('1 insufficient credits, 1 workspace paused, 1 already in flight');
   });
 });
 
@@ -145,6 +148,32 @@ describe('everyConflictIs / isAllCreditsRefusal', () => {
         conflicts: [{ testId: 'a', reason: 'billing_hold' }],
       }),
     ).toBe(false);
+  });
+});
+
+describe('paused-workspace batch refusal', () => {
+  it('takes precedence over credits when nothing dispatched', () => {
+    const conflicts = [
+      { testId: 'a', reason: 'insufficient_credits' as const },
+      { testId: 'b', reason: 'billing_hold' as const, message: 'Workspace paused.' },
+    ];
+    expect(isPausedRefusal({ accepted: [], deferred: [], conflicts })).toBe(true);
+    expect(isPausedRefusal({ accepted: [{}], deferred: [], conflicts })).toBe(false);
+    expect(isPausedRefusal({ accepted: [], deferred: [{}], conflicts })).toBe(false);
+    const err = pausedConflictError(conflicts, 'https://api.testsprite.com');
+    expect(err.code).toBe('FEATURE_GATED');
+    expect(err.exitCode).toBe(13);
+    expect(err.message).toBe('Workspace paused.');
+    expect(err.nextAction).toContain('https://www.testsprite.com/dashboard/settings/billing');
+    expect(err.details).toEqual({ reason: 'paused', conflicts: ['a', 'b'] });
+  });
+
+  it("accepts the gate's own `paused` spelling and falls back to wording that names no cause", () => {
+    const conflicts = [{ testId: 'a', reason: 'paused' as const }];
+    expect(isPausedRefusal({ accepted: [], deferred: [], conflicts })).toBe(true);
+    const err = pausedConflictError(conflicts);
+    expect(err.message).toBe('This workspace is paused.');
+    expect(err.nextAction).toMatch(/^See \S+ to resume this workspace, then retry\.$/);
   });
 });
 

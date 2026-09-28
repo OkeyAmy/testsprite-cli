@@ -6,10 +6,11 @@
  * All HTTP is mocked; no real credentials required.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { InterruptError } from '../lib/errors.js';
 import { runCreateBatch } from './test.js';
 import { runDeleteBatch } from './test.js';
 import type { CliBulkDeleteSummary } from './test.js';
@@ -139,11 +140,12 @@ describe('runCreateBatch --plan-from-dir (dogfood L1796)', () => {
 
   it('rejects when dir does not exist', async () => {
     const creds = makeCreds();
+    const noexistBase = mkdtempSync(join(tmpdir(), 'cli-pfd-noexist-'));
     await expect(
       runCreateBatch(
         {
           plans: '',
-          planFromDir: '/tmp/definitely-does-not-exist-qw-test',
+          planFromDir: join(noexistBase, 'definitely-does-not-exist-qw-test'),
           output: 'json',
           profile: 'default',
           dryRun: false,
@@ -152,7 +154,9 @@ describe('runCreateBatch --plan-from-dir (dogfood L1796)', () => {
         },
         creds,
       ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    )
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+      .finally(() => rmSync(noexistBase, { recursive: true, force: true }));
   });
 
   it('rejects when dir has no *.json files', async () => {
@@ -222,10 +226,11 @@ describe('runCreateBatch --plan-from-dir (dogfood L1796)', () => {
   it('rejects when both --plans and --plan-from-dir are supplied', async () => {
     const creds = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-pfd-mutual-'));
+    const plansFile = join(dir, 'some.jsonl');
     await expect(
       runCreateBatch(
         {
-          plans: '/tmp/some.jsonl',
+          plans: plansFile,
           planFromDir: dir,
           output: 'json',
           profile: 'default',
@@ -235,7 +240,9 @@ describe('runCreateBatch --plan-from-dir (dogfood L1796)', () => {
         },
         creds,
       ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    )
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+      .finally(() => rmSync(dir, { recursive: true, force: true }));
   });
 
   it('create-batch command exposes --plan-from-dir flag', async () => {
@@ -564,6 +571,37 @@ describe('runCreateBatch --plan-from-dir (dogfood L1796)', () => {
 // ---------------------------------------------------------------------------
 
 describe('runDeleteBatch (dogfood L1796)', () => {
+  it('stops deleting remaining tests after an interrupted request', async () => {
+    const creds = makeCreds();
+    const interruption = new InterruptError('SIGINT');
+    const deleted: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method === 'DELETE') {
+        deleted.push(url);
+        if (deleted.length === 1) throw interruption;
+        return { body: deleteResp('test_b') };
+      }
+      return { body: {} };
+    });
+
+    await expect(
+      runDeleteBatch(
+        {
+          testIds: ['test_a', 'test_b'],
+          all: false,
+          confirm: true,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toBe(interruption);
+    expect(deleted).toHaveLength(1);
+  });
+
   it('exit 5 when --confirm is not set', async () => {
     const creds = makeCreds();
     await expect(
@@ -939,14 +977,14 @@ describe('runDeleteBatch (dogfood L1796)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// DEV-331 (codex finding 2) — create-batch --run --wait interrupt partial
-// carries the dispatched runIds, not empty placeholders
+// create-batch --run --wait interrupt partial carries the dispatched runIds,
+// not empty placeholders
 // ---------------------------------------------------------------------------
 
-describe('create-batch --run --wait — InterruptError partial names dispatched runIds (DEV-331)', () => {
+describe('create-batch --run --wait — InterruptError partial names dispatched runIds', () => {
   it('interrupt mid-poll → partial rows carry the runIds recorded at trigger time', async () => {
     const creds = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-dev331-cbrun-'));
+    const dir = mkdtempSync(join(tmpdir(), 'cli-create-batch-run-'));
     for (let i = 0; i < 2; i++) {
       writeFileSync(
         join(dir, `plan_${i}.json`),

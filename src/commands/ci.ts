@@ -8,11 +8,20 @@ import {
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { CLIError, localValidationError } from '../lib/errors.js';
-import { loadConfig } from '../lib/config.js';
+import { loadConfig, resolveProfileName } from '../lib/config.js';
 import { type FetchImpl, type HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { Page } from '../lib/pagination.js';
 import { assertNotLocal } from '../lib/target-url.js';
+import {
+  classifyLinkage,
+  isValidRepoSlug,
+  parseDeploymentsPayload,
+  parseRepoSlug,
+  type DeploymentRecord,
+  type LinkageStatus,
+  type LinkageVerdict,
+} from '../lib/ci-linkage.js';
 import { recordTelemetryExtras } from '../lib/telemetry.js';
 import { VERSION } from '../version.js';
 import type { CliProject } from './project.js';
@@ -68,11 +77,12 @@ const defaultCiFs: CiFs = {
 };
 
 /** Injectable subprocess runner (defaults to a real `spawnSync`), so tests never
- * shell out. Runs `git` (default-branch detection) and `gh` (optional secret set). */
+ * shell out. Runs `git` (default-branch detection), `gh` (optional secret set,
+ * deployment history) and `npx vercel` (`ci connect`). */
 export type SpawnImpl = (
   cmd: string,
   args: string[],
-  opts: { input?: string; cwd?: string },
+  opts: { input?: string; cwd?: string; shell?: boolean },
 ) => SpawnSyncReturns<string>;
 
 const defaultSpawn: SpawnImpl = (cmd, args, opts) =>
@@ -80,7 +90,7 @@ const defaultSpawn: SpawnImpl = (cmd, args, opts) =>
     input: opts.input,
     cwd: opts.cwd,
     encoding: 'utf8',
-    shell: false,
+    shell: opts.shell ?? false,
     windowsHide: true,
   });
 
@@ -93,6 +103,10 @@ export interface CiDeps {
   cwd?: string;
   fs?: CiFs;
   spawn?: SpawnImpl;
+  /** Injected by `ci doctor --wait` tests so polling never really sleeps. */
+  sleep?: (ms: number) => Promise<void>;
+  /** OS seam for the Windows `npx` shim handling (defaults to `process.platform`). */
+  platform?: NodeJS.Platform;
 }
 
 type CommonOptions = FactoryCommonOptions;
@@ -134,10 +148,10 @@ export interface CiInitSummary {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const g = command.optsWithGlobals() as Partial<CommonOptions> & { requestTimeout?: string };
   return {
-    profile: g.profile ?? 'default',
+    profile: resolveProfileName(g.profile, env),
     output: resolveOutputMode(g.output),
     endpointUrl: g.endpointUrl,
     debug: g.debug ?? false,
@@ -547,6 +561,490 @@ async function runCiInitScaffold(
   out.print(summary, d => renderCiInitText(d as CiInitSummary));
 }
 
+// ── ci doctor / ci connect ───────────────────────────────────────────────────
+
+export interface CiDoctorOptions extends CommonOptions {
+  repo?: string;
+  /** Poll until a NEW deployment record arrives (the post-connect check). */
+  wait: boolean;
+  /** Bound for `--wait`, in seconds; undefined = `--timeout` was not given. */
+  waitTimeoutSeconds?: number;
+}
+
+export interface CiDoctorSummary {
+  repo: string;
+  status: LinkageStatus;
+  ok: boolean;
+  detail: string;
+  lastDeployAt: string | null;
+  creators: string[];
+  hasPreview: boolean;
+  /** Whether this run watched for a new record (`--wait`). */
+  waited: boolean;
+  /** `--wait` only: the record whose arrival ended the wait, or null. */
+  newDeployment: DeploymentRecord | null;
+  /** Set when history could not be read at all — then the rest is not a verdict. */
+  error: string | null;
+}
+
+/** Poll interval for `--wait`. A deploy takes minutes; 15 s keeps it cheap. */
+const DOCTOR_POLL_INTERVAL_MS = 15_000;
+
+/**
+ * `owner/repo` for the check: the explicit `--repo`, else the `origin` remote.
+ * Returns null when neither resolves — the caller turns that into guidance
+ * rather than an opaque failure.
+ */
+export function resolveRepoSlug(
+  explicit: string | undefined,
+  cwd: string,
+  spawn: SpawnImpl,
+): string | null {
+  if (explicit !== undefined && explicit !== '') {
+    return isValidRepoSlug(explicit) ? explicit : null;
+  }
+  try {
+    const res = spawn('git', ['remote', 'get-url', 'origin'], { cwd });
+    if (res.error || res.status !== 0) return null;
+    return parseRepoSlug(res.stdout ?? '');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the repo's deployment history through `gh` — the same soft dependency
+ * `--set-secret` already uses, so this adds no new requirement. It carries the
+ * user's own GitHub credentials, which a private repo needs.
+ */
+function fetchDeploymentHistory(
+  repo: string,
+  cwd: string,
+  spawn: SpawnImpl,
+): { records: DeploymentRecord[] } | { error: string } {
+  let result: SpawnSyncReturns<string>;
+  try {
+    // 100 (the API maximum) rather than a small page: the classifier separates
+    // preview from production records, and a busy repo can push dozens of
+    // production deploys past its newest preview — a short page would then read
+    // as a false `production-only`.
+    result = spawn('gh', ['api', `repos/${repo}/deployments?per_page=100`], { cwd });
+  } catch (err) {
+    return { error: `failed to run gh: ${(err as Error).message}` };
+  }
+  if (result.error) {
+    const code = (result.error as NodeJS.ErrnoException).code;
+    return {
+      error:
+        code === 'ENOENT'
+          ? 'gh CLI not found on PATH — install it (https://cli.github.com), then `gh auth login`'
+          : `gh failed: ${result.error.message}`,
+    };
+  }
+  if (result.status !== 0) {
+    const stderr = (result.stderr ?? '').split('\n')[0]?.trim() ?? '';
+    return { error: `gh exited ${result.status}${stderr ? `: ${stderr}` : ''}` };
+  }
+  return { records: parseDeploymentsPayload(result.stdout ?? '') };
+}
+
+/**
+ * Diagnose whether deployment events reach this repo — the precondition every
+ * deployment-gated workflow rests on, and the only one that fails *silently*.
+ *
+ * Exits non-zero when the chain is not live, so a script (or `ci init`) can
+ * gate on it. `--wait` makes the post-connect verification one command instead
+ * of "go watch GitHub yourself": it baselines the history on the first read and
+ * succeeds when a NEW record arrives. That success condition is a hard fact,
+ * deliberately independent of the preview/production heuristic — pushing to a
+ * default branch produces a *production* deployment, and that still proves the
+ * link is live.
+ */
+export async function runCiDoctor(opts: CiDoctorOptions, deps: CiDeps = {}): Promise<void> {
+  const stdout = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const out = new Output(opts.output, { stdout, stderr });
+  const cwd = deps.cwd ?? process.cwd();
+  const spawn = deps.spawn ?? defaultSpawn;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+
+  if (opts.waitTimeoutSeconds !== undefined && !opts.wait) {
+    throw localValidationError(
+      'timeout',
+      'only applies with --wait — add --wait, or drop --timeout',
+    );
+  }
+  const waitTimeoutSeconds = opts.waitTimeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
+
+  const repo = resolveRepoSlug(opts.repo, cwd, spawn);
+  if (repo === null) {
+    throw localValidationError(
+      'repo',
+      opts.repo
+        ? 'must look like owner/name (e.g. acme/storefront)'
+        : 'could not read a GitHub `origin` remote here — run from the repo, or pass --repo <owner/name>',
+    );
+  }
+
+  const deadline = Date.now() + waitTimeoutSeconds * 1000;
+  let verdict: LinkageVerdict | undefined;
+  let readError: string | null = null;
+  /** Newest record's timestamp on the first successful read; -∞ when it saw none. */
+  let baselineNewestMs: number | undefined;
+  let newDeployment: DeploymentRecord | null = null;
+
+  for (;;) {
+    const budgetLeft = Date.now() + DOCTOR_POLL_INTERVAL_MS <= deadline;
+    const history = fetchDeploymentHistory(repo, cwd, spawn);
+    if ('error' in history) {
+      // A transient `gh` failure (rate limit, network blip) must not abort a
+      // ten-minute watch — keep polling while budget remains. It surfaces as
+      // exit 10 only when the whole wait ends without one successful read.
+      readError = history.error;
+      if (!opts.wait || !budgetLeft) break;
+      stderr(`[wait] could not read deployment history (${history.error}) — retrying`);
+      await sleep(DOCTOR_POLL_INTERVAL_MS);
+      continue;
+    }
+    verdict = classifyLinkage(history.records, new Date());
+    if (!opts.wait) break;
+
+    const newestMs = history.records.reduce(
+      (max, r) => Math.max(max, new Date(r.createdAt).getTime()),
+      Number.NEGATIVE_INFINITY,
+    );
+    if (baselineNewestMs === undefined) {
+      // What already exists only anchors the comparison — `--wait` is about
+      // the record the user's connect + push is producing right now.
+      baselineNewestMs = newestMs;
+    } else if (newestMs > baselineNewestMs) {
+      newDeployment =
+        history.records.find(r => new Date(r.createdAt).getTime() === newestMs) ?? null;
+      break;
+    }
+    if (!budgetLeft) break;
+    stderr(
+      `[wait] no new deployment record yet — checking again in ${DOCTOR_POLL_INTERVAL_MS / 1000}s`,
+    );
+    await sleep(DOCTOR_POLL_INTERVAL_MS);
+  }
+
+  // A read failure on the LAST attempt does not erase an earlier verdict; the
+  // error only stands when no read ever succeeded.
+  const unread = verdict === undefined;
+  const summary: CiDoctorSummary = {
+    repo,
+    status: verdict?.status ?? 'none',
+    ok: verdict?.ok ?? false,
+    detail: verdict?.detail ?? readError ?? 'could not read deployment history',
+    lastDeployAt: verdict?.lastDeployAt ?? null,
+    creators: verdict?.creators ?? [],
+    hasPreview: verdict?.hasPreview ?? false,
+    waited: opts.wait,
+    newDeployment,
+    error: unread ? readError : null,
+  };
+  out.print(summary, d => renderCiDoctorText(d as CiDoctorSummary));
+
+  // A read failure is NOT a verdict — reporting "not linked" because `gh` is
+  // missing would send the user to fix the wrong thing.
+  if (unread) {
+    throw new CLIError(`ci doctor: could not read deployment history for ${repo}`, 10);
+  }
+  // A new record arriving is what `--wait` verifies: events reach this repo.
+  // The verdict above still tells the user what KIND of gate that supports.
+  if (newDeployment !== null) return;
+  if (!summary.ok) {
+    throw new CLIError(
+      `ci doctor: ${repo} is not ready for a deployment-gated workflow (${summary.status})`,
+      1,
+    );
+  }
+}
+
+export function renderCiDoctorText(s: CiDoctorSummary): string {
+  const lines: string[] = [];
+  const mark = s.error ? '[FAIL]' : s.ok ? '[OK]  ' : '[WARN]';
+  lines.push(`${mark} deployment events   ${s.repo}`);
+  if (s.newDeployment) {
+    const day = s.newDeployment.createdAt.slice(0, 10);
+    lines.push(
+      `       new deployment record: ${s.newDeployment.environment} (${day}) ✓ — events reach this repo`,
+    );
+  }
+  lines.push(`       ${s.detail}`);
+  if (s.error) {
+    lines.push('');
+    lines.push("Could not read the repo's deployment history, so this is not a verdict:");
+    lines.push(`  ${s.error}`);
+    return lines.join('\n');
+  }
+  if (s.waited && !s.newDeployment) {
+    lines.push(
+      '       (no NEW deployment record arrived while waiting — the verdict above is from the existing history)',
+    );
+  }
+  if (s.ok) return lines.join('\n');
+
+  lines.push('');
+  lines.push('Next steps:');
+  if (s.status === 'none') {
+    lines.push('  1. Link your deploy platform to this repo:');
+    lines.push('       testsprite ci connect          # runs `vercel git connect` for you');
+    lines.push("     …or link the repo in your platform's dashboard.");
+    // A branch, not the default branch: a default-branch push deploys as
+    // PRODUCTION, which proves the link but is not what a PR gate keys on.
+    lines.push('  2. Push a commit on a branch so a preview deployment lands:');
+    lines.push('       git checkout -b verify-testsprite-ci');
+    lines.push(
+      '       git commit --allow-empty -m "verify testsprite ci" && git push -u origin HEAD',
+    );
+    lines.push('  3. Confirm the events arrive (any new deployment record counts):');
+    lines.push('       testsprite ci doctor --wait');
+  } else if (s.status === 'production-only') {
+    lines.push('  → Enable preview deployments for pull requests on your deploy platform.');
+    lines.push('    A PR gate keys on preview deployments; production-only events fire on');
+    lines.push('    releases instead, so the check would never run on a PR.');
+  } else {
+    lines.push('  → Push a commit and re-run `testsprite ci doctor --wait` to confirm the link');
+    lines.push('    is still live before scaffolding a gate on it.');
+  }
+  lines.push('');
+  lines.push('Self-hosted pipeline? Report each deploy yourself, and every path works the same:');
+  // `required_contexts: []` is load-bearing: without it GitHub answers 409 when
+  // any commit status on the SHA is failing — i.e. exactly when a PR pipeline is
+  // deploying its preview. JSON input because `-f` would send the empty array as
+  // a string. (Both learned the hard way running this against a real repo.)
+  lines.push(
+    `  ID=$(printf '{"ref":"%s","environment":"preview","auto_merge":false,"required_contexts":[]}' "$SHA" \\`,
+  );
+  lines.push(`    | gh api repos/${s.repo}/deployments --input - --jq .id)`);
+  lines.push(
+    `  gh api repos/${s.repo}/deployments/$ID/statuses -f state=success -f environment_url=$URL`,
+  );
+  return lines.join('\n');
+}
+
+export interface CiConnectOptions extends CommonOptions {
+  /** Vercel project to link when this directory is not linked yet. */
+  project?: string;
+}
+
+export interface CiConnectSummary {
+  platform: 'vercel';
+  /** The commands that were actually spawned, in order — no secrets in them. */
+  ran: string[];
+  connected: boolean;
+  alreadyConnected: boolean;
+  reason: string | null;
+}
+
+/**
+ * The Vercel CLI, pinned to the major this command's flag semantics were
+ * verified against (59.23.2). Unpinned, a breaking Vercel release could change
+ * what `--non-interactive` refuses or creates under a tool people run in CI.
+ * (Unrelated to the TestSprite CLI's own `latest` policy — this pins a THIRD
+ * PARTY whose behavior we shell out to.) Bump deliberately, re-testing the
+ * ladder below.
+ */
+const VERCEL_CLI_SPEC = 'vercel@59';
+
+/** What Vercel accepts as a project name — and all that may reach the Windows
+ * shell path below, so keep it strict. */
+const VERCEL_PROJECT_NAME_RE = /^[a-z0-9._-]{1,100}$/;
+
+/**
+ * `--non-interactive` refusals come back as one JSON object with a `reason`
+ * and often a `next[]` of literal commands — relay those, since Vercel's own
+ * instructions beat anything we could paraphrase. Anything else falls back to
+ * the first non-empty output line.
+ */
+function vercelFailureDetail(result: SpawnSyncReturns<string>): string {
+  for (const chunk of [result.stdout ?? '', result.stderr ?? '']) {
+    const trimmed = chunk.trim();
+    if (!trimmed.startsWith('{')) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as { reason?: unknown; next?: unknown };
+      if (typeof parsed.reason === 'string') {
+        const next = Array.isArray(parsed.next)
+          ? parsed.next.filter((n): n is string => typeof n === 'string')
+          : [];
+        return next.length > 0 ? `${parsed.reason} — next: ${next.join(' && ')}` : parsed.reason;
+      }
+    } catch {
+      /* prose after all — fall through */
+    }
+  }
+  return (
+    `${result.stdout ?? ''}\n${result.stderr ?? ''}`
+      .split('\n')
+      .find(l => l.trim() !== '')
+      ?.trim() ?? ''
+  );
+}
+
+/**
+ * Link the deploy platform to the repo — the fix for `ci doctor`'s `none`.
+ *
+ * Runs the platform's OWN CLI as a subprocess (`npx vercel …`, so nothing needs
+ * pre-installing) rather than calling Vercel's API ourselves. That is a
+ * deliberate boundary: any other approach would require the user to hand us a
+ * Vercel token, and a third-party credential should never pass through this
+ * CLI. Vercel's CLI keeps its own credentials; we only read exit codes.
+ *
+ * Every step runs `--non-interactive`, and `--yes` is NEVER passed to the
+ * Vercel CLI on any path. `--yes` does not mean "skip confirmations": on an
+ * unlinked directory `vercel link --yes` answers the new-project questions
+ * with the default scope and the current directory name — creating a project
+ * nobody asked for, which `git connect` then wires the repo to and starts
+ * deploying. `ci doctor` would report that as `linked`: the exact silent
+ * false-green this command exists to prevent. When Vercel needs a decision it
+ * refuses with a structured reason instead, and that is relayed.
+ *
+ * `vercel git connect` is effectively idempotent — an already-connected repo
+ * says so, which also resolves the one ambiguity `ci doctor` cannot see from
+ * GitHub: "never linked" vs "linked but never deployed".
+ */
+export async function runCiConnect(opts: CiConnectOptions, deps: CiDeps = {}): Promise<void> {
+  const stdout = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const out = new Output(opts.output, { stdout, stderr });
+  const cwd = deps.cwd ?? process.cwd();
+  const spawn = deps.spawn ?? defaultSpawn;
+  const fs = deps.fs ?? defaultCiFs;
+  const platform = deps.platform ?? process.platform;
+  const ran: string[] = [];
+
+  // Input gate before any subprocess or fs read: a bad name must fail as a
+  // validation error, not as a spawned command's stderr.
+  if (opts.project !== undefined && !VERCEL_PROJECT_NAME_RE.test(opts.project)) {
+    throw localValidationError(
+      'project',
+      'must be a Vercel project name (lowercase letters, digits, ".", "_", "-"; max 100 chars)',
+    );
+  }
+
+  const finish = (over: Partial<CiConnectSummary>, failure?: string): void => {
+    const summary: CiConnectSummary = {
+      platform: 'vercel',
+      ran,
+      connected: false,
+      alreadyConnected: false,
+      reason: null,
+      ...over,
+    };
+    out.print(summary, d => renderCiConnectText(d as CiConnectSummary));
+    if (failure !== undefined) throw new CLIError(failure, 1);
+  };
+
+  const run = (args: string[]): SpawnSyncReturns<string> | { failure: string } => {
+    ran.push(`npx ${VERCEL_CLI_SPEC} ${args.join(' ')}`);
+    try {
+      // npx's own `--yes` only suppresses its install prompt; nothing after the
+      // package spec is a `--yes` (see the function comment). On Windows `npx`
+      // is a `.cmd` shim, which `spawnSync` cannot launch with `shell: false`
+      // (EINVAL since Node 20.12's CVE-2024-27980 hardening, ENOENT before) —
+      // go through the shell there. Safe because every argument is a literal or
+      // validated against VERCEL_PROJECT_NAME_RE, never free text.
+      return platform === 'win32'
+        ? spawn('npx.cmd', ['--yes', VERCEL_CLI_SPEC, ...args], { cwd, shell: true })
+        : spawn('npx', ['--yes', VERCEL_CLI_SPEC, ...args], { cwd });
+    } catch (err) {
+      return { failure: `failed to run npx: ${(err as Error).message}` };
+    }
+  };
+
+  // `.vercel/project.json` is how the Vercel CLI itself records which project
+  // this directory is linked to. Present → the project is already decided and
+  // `git connect` is safe to run directly.
+  let dirLinked = false;
+  try {
+    await fs.readFile(path.join(cwd, '.vercel', 'project.json'));
+    dirLinked = true;
+  } catch {
+    /* not linked */
+  }
+
+  if (!dirLinked) {
+    if (opts.project === undefined || opts.project === '') {
+      // Refuse rather than guess: picking (or worse, creating) a project is
+      // the one decision this command must never make for the user.
+      finish(
+        { reason: 'this directory is not linked to a Vercel project' },
+        'ci connect: this directory is not linked to a Vercel project — pass --project <name>, or run `npx vercel link` to pick one interactively, then re-run',
+      );
+      return;
+    }
+    // `link --project <name>` targets an EXISTING project by name, so it needs
+    // no `--yes` and cannot create one as a side effect.
+    const link = run(['link', '--project', opts.project, '--non-interactive']);
+    if ('failure' in link) {
+      finish({ reason: link.failure }, `ci connect: ${link.failure}`);
+      return;
+    }
+    if (link.status !== 0) {
+      const detail = vercelFailureDetail(link);
+      finish(
+        { reason: `vercel link failed${detail ? `: ${detail}` : ''}` },
+        `ci connect: could not link this directory to Vercel project "${opts.project}"${detail ? ` — ${detail}` : ''}`,
+      );
+      return;
+    }
+  }
+
+  const connect = run(['git', 'connect', '--non-interactive']);
+  if ('failure' in connect) {
+    finish({ reason: connect.failure }, `ci connect: ${connect.failure}`);
+    return;
+  }
+  // "already connected" is prose on exit 1 with no JSON — Vercel offers no
+  // structured way to see it (`project inspect` does not expose git-link
+  // state), so a regex on the CLI's wording is load-bearing here. If Vercel
+  // rephrases it, this degrades to the generic relay below (a hard failure
+  // with Vercel's own message), never to a wrong success.
+  const output = `${connect.stdout ?? ''}\n${connect.stderr ?? ''}`;
+  const alreadyConnected = /already connected/i.test(output);
+  if (connect.status !== 0 && !alreadyConnected) {
+    const detail = vercelFailureDetail(connect);
+    // The common dead ends — not logged in (browser OAuth), the Vercel GitHub
+    // App not installed, missing org permission — all need a human. Relay the
+    // CLI's own message verbatim rather than paraphrasing the fix away.
+    finish(
+      { reason: detail || `vercel git connect exited ${connect.status}` },
+      `ci connect: ${detail || 'could not connect the repo'}`,
+    );
+    return;
+  }
+
+  finish({ connected: true, alreadyConnected });
+  stderr(
+    alreadyConnected
+      ? '[info] the repo was already connected — if `ci doctor` still reports no events, it simply has not deployed yet.'
+      : '[info] connected. Linking only affects FUTURE pushes.',
+  );
+  stderr('Next: push a commit on a branch so a preview deployment lands:');
+  stderr('  git checkout -b verify-testsprite-ci');
+  stderr('  git commit --allow-empty -m "verify testsprite ci" && git push -u origin HEAD');
+  stderr('Then: testsprite ci doctor --wait');
+}
+
+export function renderCiConnectText(s: CiConnectSummary): string {
+  if (s.connected) {
+    return s.alreadyConnected
+      ? 'Vercel is already connected to this repo.'
+      : 'Connected Vercel to this repo.';
+  }
+  const lines = [`Could not connect automatically: ${s.reason ?? 'unknown reason'}.`, ''];
+  lines.push('Do it manually:');
+  lines.push('  npx vercel login        # if you are not signed in');
+  lines.push('  npx vercel link         # pick the Vercel project for this directory');
+  lines.push('  npx vercel git connect  # link it to the git remote');
+  lines.push('');
+  lines.push('…then re-run `testsprite ci connect`, or finish from the Vercel dashboard');
+  lines.push('(Project → Settings → Git).');
+  return lines.join('\n');
+}
+
 // ── text rendering ───────────────────────────────────────────────────────────
 
 export function renderCiInitText(s: CiInitSummary): string {
@@ -600,7 +1098,7 @@ export function createCiCommand(deps: CiDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (platform: string, cmdOpts, command: Command) => {
-      const common = resolveCommonOptions(command);
+      const common = resolveCommonOptions(command, deps.env);
       const opts: CiInitOptions = {
         ...common,
         platform,
@@ -613,6 +1111,71 @@ export function createCiCommand(deps: CiDeps = {}): Command {
         repo: cmdOpts.repo,
       };
       await runCiInit(opts, deps);
+    });
+
+  ci.command('doctor')
+    .description(
+      'Check that deployment events reach this repo — the precondition a deployment-gated workflow rests on',
+    )
+    .option('--repo <owner/name>', 'repo to check (inferred from the `origin` remote if omitted)')
+    .option(
+      '--wait',
+      'keep checking until a NEW deployment record arrives (use right after connecting + pushing)',
+      false,
+    )
+    .option('--timeout <s>', 'with --wait, how long to keep checking (1-3600, default 600)')
+    .addHelpText(
+      'after',
+      '\nWhy this exists:\n' +
+        '  A workflow triggered by deployments only fires if the repo actually receives\n' +
+        "  GitHub Deployment events. When the deploy platform isn't linked to the repo,\n" +
+        '  nothing is ever written and the gate stays silent — with no error anywhere.\n' +
+        '\n--wait succeeds when any new deployment record arrives, whatever its\n' +
+        'environment — a new record is the hard fact that events reach this repo.\n' +
+        '\nExit codes:\n' +
+        '  0  events reach this repo (a gate will fire), or --wait saw a new record\n' +
+        '  1  no usable events yet — see the printed next steps\n' +
+        '  5  validation error (bad --repo, or no GitHub remote here)\n' +
+        ' 10  could not read the history (gh missing / unauthenticated) — not a verdict',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (cmdOpts, command: Command) => {
+      const common = resolveCommonOptions(command, deps.env);
+      await runCiDoctor(
+        {
+          ...common,
+          repo: cmdOpts.repo,
+          wait: cmdOpts.wait === true,
+          // undefined = flag not given; runCiDoctor refuses it without --wait.
+          waitTimeoutSeconds:
+            cmdOpts.timeout === undefined ? undefined : parseTimeoutSeconds(cmdOpts.timeout),
+        },
+        deps,
+      );
+    });
+
+  ci.command('connect')
+    .description('Link your deploy platform (Vercel) to this repo so deployment events are emitted')
+    .option(
+      '--project <name>',
+      'Vercel project to link when this directory is not linked yet (must already exist)',
+    )
+    .addHelpText(
+      'after',
+      "\nRuns the platform's own CLI (`npx vercel link` / `vercel git connect`) as a\n" +
+        'subprocess, always non-interactively: when a decision is needed (which project\n' +
+        'to link) it refuses and says so rather than creating anything you did not pick.\n' +
+        'Your Vercel credentials stay with the Vercel CLI — this command never asks for,\n' +
+        'stores, or transmits a platform token.\n' +
+        '\nNote: `vercel link` itself writes `.vercel/`, may add a VERCEL_OIDC_TOKEN line\n' +
+        'to `.env.local`, and may update `.gitignore` — the Vercel CLI’s own behavior.\n' +
+        '\nLinking only affects FUTURE pushes: push a commit afterwards, then confirm with\n' +
+        '`testsprite ci doctor --wait`.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (cmdOpts, command: Command) => {
+      const common = resolveCommonOptions(command, deps.env);
+      await runCiConnect({ ...common, project: cmdOpts.project }, deps);
     });
 
   return ci;

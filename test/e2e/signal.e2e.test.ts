@@ -18,7 +18,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -124,8 +124,8 @@ async function waitAndInterrupt(
   return { code, signal: exitSignal, stdout, stderr };
 }
 
-describe.skipIf(isWindows)('signal e2e — graceful detach during test wait (DEV-331)', () => {
-  it('SIG-1/SIG-2: SIGINT → exit 130, partial JSON on stdout, honest stderr hint', async () => {
+describe.skipIf(isWindows)('signal e2e — graceful detach during test wait', () => {
+  it('SIGINT (json mode) → exit 130, partial JSON on stdout, honest stderr hint', async () => {
     const result = await waitAndInterrupt('SIGINT', ['--output', 'json']);
     expect(result.code).toBe(130);
 
@@ -139,10 +139,15 @@ describe.skipIf(isWindows)('signal e2e — graceful detach during test wait (DEV
     expect(result.stderr).toContain('billing');
     expect(result.stderr).toContain(`testsprite test wait ${RUN_ID}`);
     expect(result.stderr).toContain('"code": "INTERRUPTED"');
+    expect(result.stderr).toContain(
+      '"nextAction": "The server-side run (if any) keeps executing and billing. ' +
+        'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
+        '(runId is in the partial JSON on stdout)."',
+    );
     expect(result.stderr).toContain('"signal": "SIGINT"');
   }, 30_000);
 
-  it('SIG-1 (text mode): SIGINT → exit 130, human-readable partial + hint', async () => {
+  it('SIGINT (text mode) → exit 130, human-readable partial + hint', async () => {
     const result = await waitAndInterrupt('SIGINT');
     expect(result.code).toBe(130);
     expect(result.stdout).toContain(RUN_ID);
@@ -151,17 +156,17 @@ describe.skipIf(isWindows)('signal e2e — graceful detach during test wait (DEV
     expect(result.stderr).toContain('Error: Interrupted by SIGINT.');
   }, 30_000);
 
-  it('SIG-3: SIGTERM → exit 143', async () => {
+  it('SIGTERM → exit 143', async () => {
     const result = await waitAndInterrupt('SIGTERM', ['--output', 'json']);
     expect(result.code).toBe(143);
     expect(result.stderr).toContain('Interrupted (SIGTERM)');
     expect(result.stderr).toContain('"signal": "SIGTERM"');
   }, 30_000);
 
-  it('SIG-7: SIGINT during a non-wait command → immediate exit 130 with the generic explanation', async () => {
+  it('SIGINT drains an in-flight non-wait request but exits immediately at an idle prompt', async () => {
     // `test list` is outside any armed --wait scope. The stub hangs its fetch;
-    // the disarmed handler must exit immediately with the generic explanation
-    // (no partial envelope — there is no runId to re-attach to).
+    // the disarmed handler prints the generic explanation, then lets the
+    // aborted request reach the shared top-level catch.
     const child = spawn(process.execPath, [BIN_PATH, 'test', 'list', '--project', 'p1'], {
       env: {
         ...process.env,
@@ -184,10 +189,54 @@ describe.skipIf(isWindows)('signal e2e — graceful detach during test wait (DEV
     expect(code).toBe(130);
     expect(stderr).toContain('Interrupted (SIGINT)');
     expect(stderr).toContain('test wait');
+    expect(stderr).toContain('Error: Interrupted by SIGINT.');
     expect(stderr).not.toContain('    at '); // no stack trace / corrupted output
+
+    // `setup` waits at a prompt with no request to abort. Mark the piped stdin
+    // as interactive in a tiny launcher so the real CLI enters that prompt.
+    const launch = `Object.defineProperty(process.stdin, 'isTTY', { value: true }); process.argv = [process.execPath, ${JSON.stringify(BIN_PATH)}, 'setup', '--no-agent']; await import(${JSON.stringify(pathToFileURL(BIN_PATH).href)});`;
+    const idleChild = spawn(process.execPath, ['--input-type=module', '--eval', launch], {
+      env: {
+        ...process.env,
+        TESTSPRITE_API_KEY: '',
+        TESTSPRITE_NO_SKILL_WARNING: '1',
+        TESTSPRITE_NO_UPDATE_NOTIFIER: '1',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let idleStderr = '';
+    const prompted = new Promise<void>(resolvePrompt => {
+      idleChild.stderr.on('data', (chunk: Buffer) => {
+        idleStderr += chunk.toString();
+        if (idleStderr.includes('TestSprite API key:')) resolvePrompt();
+      });
+    });
+    const idleExited = new Promise<number | null>(resolveExit => {
+      idleChild.on('exit', exitCode => resolveExit(exitCode));
+    });
+    let promptTimer: ReturnType<typeof setTimeout> | undefined;
+    const promptDeadline = new Promise<never>((_resolve, reject) => {
+      promptTimer = setTimeout(() => reject(new Error('setup prompt did not appear')), 10_000);
+    });
+    try {
+      await Promise.race([
+        prompted,
+        idleExited.then(exitCode => {
+          throw new Error(`setup exited before prompting (${exitCode}): ${idleStderr}`);
+        }),
+        promptDeadline,
+      ]);
+      idleChild.kill('SIGINT');
+      expect(await idleExited).toBe(130);
+      expect(idleStderr).toContain('Interrupted (SIGINT)');
+      expect(idleStderr).not.toContain('Error: Interrupted by SIGINT.');
+    } finally {
+      clearTimeout(promptTimer);
+      idleChild.kill('SIGKILL');
+    }
   }, 30_000);
 
-  it('SIG-8: detach then re-attach — the same runId can be waited on again (server unaffected)', async () => {
+  it('detach then re-attach — the same runId can be waited on again (server unaffected)', async () => {
     // First wait: interrupted.
     const first = await waitAndInterrupt('SIGINT', ['--output', 'json']);
     expect(first.code).toBe(130);

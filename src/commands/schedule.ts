@@ -6,12 +6,14 @@ import {
   parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
+import { resolveProfileName } from '../lib/config.js';
 import { ApiError } from '../lib/errors.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { formatScheduleFrequencyAdvisory, runsPerMonth } from '../lib/cron.js';
 import { renderTextTable, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
+import { historyRetentionNote, type HistoryRetentionMeta } from '../lib/history-retention.js';
 
 /** A schedule as returned by the API. */
 export interface CliSchedule {
@@ -155,6 +157,7 @@ export interface CliScheduleRun {
 /** `GET /schedules/{id}/runs` response. Not paginated. */
 interface ScheduleRunListResponse {
   runs: CliScheduleRun[];
+  meta?: HistoryRetentionMeta;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,10 +419,15 @@ export async function runRunList(
     `/schedules/${encodeURIComponent(opts.scheduleId)}/runs`,
   );
   const runs = response.runs ?? [];
-  out.print({ runs }, () =>
+  const outputResponse = { ...response, runs };
+  out.print(outputResponse, () =>
     renderRunListText(runs, { columns: opts.columns, noHeader: opts.noHeader }),
   );
-  return { runs };
+  if (opts.output === 'text') {
+    const note = historyRetentionNote(response.meta, client.resolvedBaseUrl);
+    if (note) (deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`)))(note);
+  }
+  return outputResponse;
 }
 
 // ---------------------------------------------------------------------------
@@ -559,7 +567,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
     .action(async (cmdOpts: { columns?: string; header?: boolean }, command: Command) => {
       await runList(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           columns: cmdOpts.columns,
           noHeader: cmdOpts.header === false,
         },
@@ -581,7 +589,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (scheduleId: string, _cmdOpts: unknown, command: Command) => {
-      await runGet({ ...resolveCommonOptions(command), scheduleId }, deps);
+      await runGet({ ...resolveCommonOptions(command, deps.env), scheduleId }, deps);
     });
 
   schedule
@@ -617,7 +625,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
     .action(async (cmdOpts: Record<string, string | undefined>, command: Command) => {
       await runCreate(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           name: cmdOpts.name,
           targetType: cmdOpts.targetType,
           targetId: cmdOpts.targetId,
@@ -668,7 +676,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
       ) => {
         await runUpdate(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             scheduleId,
             name: cmdOpts.name as string | undefined,
             cron: cmdOpts.cron as string | undefined,
@@ -710,7 +718,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
       ) => {
         await runDelete(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             scheduleId,
             confirm: cmdOpts.confirm === true,
             idempotencyKey: cmdOpts.idempotencyKey,
@@ -745,7 +753,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
       ) => {
         await runRunList(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             scheduleId,
             columns: cmdOpts.columns,
             noHeader: cmdOpts.header === false,
@@ -762,12 +770,12 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,

@@ -39,7 +39,7 @@
  * and say why. See `openTunnelSession`'s `onFatal`.
  */
 
-import { ApiError } from './errors.js';
+import { ApiError, InterruptError } from './errors.js';
 import { ErrCode, TunnelClient } from '../vendor/tunnel-client/index.js';
 import { DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS } from '../vendor/tunnel-client/config.js';
 import type { LogLevel, TunnelClientOptions } from '../vendor/tunnel-client/index.js';
@@ -119,6 +119,16 @@ export interface OpenTunnelSessionOptions {
   connectTimeoutMs?: number;
   /** Called once, the first time the tunnel becomes unusable for this run. */
   onFatal?: (reason: TunnelFatalReason, message?: string) => void;
+  /**
+   * Called once, right after the mint succeeds and BEFORE the connect attempt,
+   * with the binding's non-secret handle. A process killed while connecting
+   * never reaches the line a caller prints after connect, and the binding it
+   * leaves behind holds a slot of the per-account cap until it expires; this
+   * is what lets the caller name that binding while it still can. Not called
+   * for an adopted client. A throw is treated like a failed connect: the
+   * binding is deleted and the error propagates.
+   */
+  onMinted?: (minted: { clientId: string; expiresAt: string }) => void;
   /**
    * Attach to a client someone else minted (`testsprite tunnel start` in
    * another terminal) instead of minting one. No secret is available, so
@@ -340,6 +350,7 @@ export async function openTunnelSession(
   };
 
   try {
+    options.onMinted?.({ clientId: minted.clientId, expiresAt: minted.expiresAt });
     client = createClient({
       clientId: minted.clientId,
       secret: minted.secret,
@@ -403,6 +414,7 @@ export async function openTunnelSession(
     });
   } catch (err) {
     await stopAndDestroy();
+    if (err instanceof InterruptError) throw err;
     if (err instanceof ApiError) throw err;
     throw ApiError.fromEnvelope({
       error: {

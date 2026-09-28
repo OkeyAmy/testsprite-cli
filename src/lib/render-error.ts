@@ -97,6 +97,19 @@ export function renderAmbiguousOrgCandidates(candidates: unknown): string[] {
   return lines;
 }
 
+/** Text-mode recovery handles for the account's tunnel binding limit. */
+export function renderTunnelBindingLimitIds(details: unknown): string[] {
+  if (!Array.isArray(details)) return [];
+  const ids = details.filter((value): value is string => typeof value === 'string');
+  if (ids.length === 0) return [];
+  const lines = ids.slice(0, 20).map(id => `  tunnel: ${id}`);
+  if (ids.length > 20) lines.push(`  … and ${ids.length - 20} more`);
+  lines.push(
+    '  hint: testsprite tunnel list · testsprite tunnel stop <client-id> · testsprite tunnel stop --all --confirm',
+  );
+  return lines;
+}
+
 export function rephraseUnknownOption(raw: string): string | null {
   // Commander emits: "error: unknown option '--foo'"
   const match = /unknown option\s+'--([^']+)'/.exec(raw);

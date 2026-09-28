@@ -1,10 +1,14 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DRY_RUN_API_KEY,
   DRY_RUN_BANNER,
   assertValidApiKeyHeaderValue,
   assertValidEndpointUrl,
   emitDryRunBanner,
+  createHttpClientFactory,
   makeHttpClient,
   parseRequestTimeoutFlag,
   resetDryRunBannerForTesting,
@@ -16,8 +20,66 @@ import {
   REQUEST_TIMEOUT_MIN_MS,
 } from './http.js';
 import { ApiError } from './errors.js';
+import { ShutdownController, globalShutdown } from './interrupt.js';
 
-const NO_CREDS_PATH = '/tmp/testsprite-cli-test-no-such-file-1234.ini';
+// Shared "no such credentials file" fixture, reused across every test below
+// that needs a credentialsPath but never actually reads it (dry-run, or an
+// env-supplied API key short-circuits the file read first). A single
+// mkdtempSync-created directory, cleaned up once the file's tests finish,
+// keeps the fixture out of a predictable shared /tmp path.
+const NO_CREDS_DIR = mkdtempSync(join(tmpdir(), 'cli-client-factory-no-creds-'));
+const NO_CREDS_PATH = join(NO_CREDS_DIR, 'testsprite-cli-test-no-such-file-1234.ini');
+afterAll(() => {
+  rmSync(NO_CREDS_DIR, { recursive: true, force: true });
+});
+
+describe.each([false, true])('request tracking with dryRun=%s', dryRun => {
+  const opts = { profile: 'default', output: 'json' as const, debug: false, dryRun };
+  const env = dryRun ? {} : { TESTSPRITE_API_KEY: 'sk-user-test' };
+
+  afterEach(() => {
+    resetDryRunBannerForTesting();
+  });
+
+  it('forwards an injected shutdown handle through the client factory', async () => {
+    const shutdown = new ShutdownController();
+    const tracking = vi.spyOn(shutdown, 'runCriticalOperation');
+    const client = createHttpClientFactory(opts, {
+      env,
+      credentialsPath: NO_CREDS_PATH,
+      fetchImpl: async () => new Response('{"ok":true}', { status: 200 }),
+      stderr: () => {},
+      shutdown,
+    })();
+
+    expect(await client.get('/me')).toEqual({ ok: true });
+    expect(tracking).toHaveBeenCalledTimes(1);
+  });
+
+  it('defaults to the process shutdown coordinator', async () => {
+    let resolveFetch!: (response: Response) => void;
+    const fetchImpl = vi.fn(
+      () =>
+        new Promise<Response>(resolve => {
+          resolveFetch = resolve;
+        }),
+    ) as unknown as typeof fetch;
+    const client = makeHttpClient(opts, {
+      env,
+      credentialsPath: NO_CREDS_PATH,
+      fetchImpl,
+      stderr: () => {},
+    });
+
+    const pending = client.get('/me');
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+    expect(globalShutdown.hasCriticalOperations).toBe(true);
+
+    resolveFetch(new Response('{"ok":true}', { status: 200 }));
+    expect(await pending).toEqual({ ok: true });
+    expect(globalShutdown.hasCriticalOperations).toBe(false);
+  });
+});
 
 describe('makeHttpClient — dry-run path', () => {
   afterEach(() => {
@@ -266,7 +328,7 @@ describe('makeHttpClient — requestTimeoutMs propagation', () => {
   it('passes requestTimeoutMs from flag to the HttpClient (dry-run path)', () => {
     const client = makeHttpClient(
       { profile: 'default', output: 'json', debug: false, dryRun: true, requestTimeoutMs: 30_000 },
-      { env: {} as NodeJS.ProcessEnv, credentialsPath: '/tmp/no-such-file.ini', stderr: () => {} },
+      { env: {} as NodeJS.ProcessEnv, credentialsPath: NO_CREDS_PATH, stderr: () => {} },
     );
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((client as any).requestTimeoutMs).toBe(30_000);
@@ -277,7 +339,7 @@ describe('makeHttpClient — requestTimeoutMs propagation', () => {
       { profile: 'default', output: 'json', debug: false, dryRun: true },
       {
         env: { TESTSPRITE_REQUEST_TIMEOUT_MS: '10000' } as NodeJS.ProcessEnv,
-        credentialsPath: '/tmp/no-such-file.ini',
+        credentialsPath: NO_CREDS_PATH,
         stderr: () => {},
       },
     );
@@ -288,7 +350,7 @@ describe('makeHttpClient — requestTimeoutMs propagation', () => {
   it('falls back to REQUEST_TIMEOUT_DEFAULT_MS when neither flag nor env is set', () => {
     const client = makeHttpClient(
       { profile: 'default', output: 'json', debug: false, dryRun: true },
-      { env: {} as NodeJS.ProcessEnv, credentialsPath: '/tmp/no-such-file.ini', stderr: () => {} },
+      { env: {} as NodeJS.ProcessEnv, credentialsPath: NO_CREDS_PATH, stderr: () => {} },
     );
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((client as any).requestTimeoutMs).toBe(REQUEST_TIMEOUT_DEFAULT_MS);

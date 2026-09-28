@@ -793,7 +793,7 @@ describe('agent list', () => {
     expect(result.status).toBe(0);
 
     // Header must include AGENT and SKILL columns; STATUS/MODE were dropped from
-    // the text table in DEV-279 (still present in --output json).
+    // the text table (still present in --output json).
     expect(result.stdout).toContain('AGENT');
     expect(result.stdout).toContain('SKILL');
     expect(result.stdout).not.toContain('STATUS');
@@ -847,12 +847,12 @@ describe('agent list', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 11b. agent status — a fresh install of every target must read clean (DEV-672)
+// 11b. agent status — a fresh install of every target must read clean
 // ---------------------------------------------------------------------------
 
 describe('agent status after a full install', () => {
   // The install→status round trip had no e2e coverage at all, which is how a
-  // permanent false `stale` on the compact-body targets shipped (DEV-672).
+  // permanent false `stale` on the compact-body targets shipped.
   it('every target × skill reads ok and the command exits 0', () => {
     const tmpDir = freshTmpDir();
     const allTargets = Object.keys(TARGETS) as AgentTarget[];
@@ -876,7 +876,7 @@ describe('agent status after a full install', () => {
   });
 
   // `agent status`'s own error message sends the user to `agent install`, with
-  // `--force` for own-file targets. Under DEV-672 that advice was a dead end —
+  // `--force` for own-file targets. That advice used to be a dead end —
   // install saw the file as already current and skipped it, status still said
   // stale — so the loop is worth pinning, not just the plain round trip.
   it('re-running install with --force leaves every row ok and exits 0', () => {
@@ -924,12 +924,12 @@ describe('matrix coverage guard', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Bootstrap tip (piece-3) — SKIPPED in e2e
+// Bootstrap tip — SKIPPED in e2e
 // Note: tip coverage lives in src/commands/auth.test.ts. Wiring a /me stub
 // for `auth configure` is disproportionate here; the unit tests cover the tip.
 // ---------------------------------------------------------------------------
 it.skip('bootstrap tip after auth configure — see auth.test.ts for tip coverage', () => {
-  // No-op: piece-3 unit tests in src/commands/auth.test.ts cover the tip.
+  // No-op: unit tests in src/commands/auth.test.ts cover the tip.
 });
 
 // ---------------------------------------------------------------------------

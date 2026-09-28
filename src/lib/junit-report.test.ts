@@ -241,6 +241,24 @@ describe('buildJUnitReport', () => {
     expect(xml).toContain('<failure message="Timed out" type="timeout">');
   });
 
+  it('renders an undispatched member with its reason as a skipped testcase', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'ran', status: 'passed' }),
+        makeResult({
+          testId: 'missing',
+          status: 'skipped',
+          error: { code: 'NOT_DISPATCHED', message: 'not a member of this list (not dispatched)' },
+        }),
+      ],
+    });
+    expect(xml).toContain('tests="2" failures="0" errors="0" skipped="1"');
+    expect(xml).toContain('testId="missing" time="0">');
+    expect(xml).toContain('<skipped message="not a member of this list (not dispatched)"/>');
+  });
+
   it('maps API error status to error elements', () => {
     const xml = buildJUnitReport({
       suiteName: 'Batch',

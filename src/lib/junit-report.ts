@@ -3,6 +3,7 @@ import { rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { localValidationError, TransportError } from './errors.js';
+import { isNonDispatchedStatus, type CiSummary } from './gh-output.js';
 
 export type JUnitReportFormat = 'junit';
 
@@ -14,6 +15,8 @@ export interface JUnitTestResult {
   /** Observed on polled runs; used for classname when --project is omitted. */
   projectId?: string;
   error?: { code: string; message: string; exitCode?: number };
+  /** Why a member was skipped before dispatch. */
+  skipReason?: string;
   /**
    * Human-readable test name for the `testcase name` attribute. Falls back to
    * `testId` when absent (older data / a run whose name could not be resolved).
@@ -144,7 +147,7 @@ type JUnitOutcome = 'passed' | 'failure' | 'error' | 'skipped';
 
 function classifyJUnitOutcome(status: string, error?: JUnitTestResult['error']): JUnitOutcome {
   if (status === 'passed') return 'passed';
-  if (status === 'skipped') return 'skipped';
+  if (isNonDispatchedStatus(status)) return 'skipped';
   if (status === 'error' || error?.exitCode === 3) return 'error';
   return 'failure';
 }
@@ -197,7 +200,9 @@ function renderTestcase(result: JUnitTestResult, classname: string): string {
     );
     lines.push(`      <error message="${message}" type="${type}">${body}</error>`);
   } else if (outcome === 'skipped') {
-    lines.push(`      <skipped/>`);
+    lines.push(
+      `      <skipped message="${escapeXml(result.skipReason ?? failureMessage(result))}"/>`,
+    );
   }
 
   lines.push('    </testcase>');
@@ -205,7 +210,7 @@ function renderTestcase(result: JUnitTestResult, classname: string): string {
 }
 
 /**
- * Build a JUnit XML document from batch poll results. Per-`testcase` `time` is
+ * Build a JUnit XML document from batch results, including skipped members. Per-`testcase` `time` is
  * the run's wall-clock duration (from `startedAt`/`finishedAt`); the `testsuite`
  * `time` is their sum. `time` falls back to `0` for a run with no timing.
  */
@@ -238,6 +243,18 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
     '</testsuites>',
     '',
   ].join('\n');
+}
+
+/**
+ * The summary's non-dispatched rows (deferred / conflict / not-found) as
+ * skipped JUnit results. Accepted rows carry run statuses and never match
+ * `isNonDispatchedStatus`, so the filter alone separates the two without
+ * relying on row order.
+ */
+export function skippedJUnitResultsFromSummary(summary: CiSummary): JUnitTestResult[] {
+  return summary.runs
+    .filter(row => isNonDispatchedStatus(row.status))
+    .map(row => ({ testId: row.testId, status: 'skipped', skipReason: row.error ?? row.status }));
 }
 
 async function assertReportFileParent(rawPath: string): Promise<string> {

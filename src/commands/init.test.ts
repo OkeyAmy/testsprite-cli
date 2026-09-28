@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, CLIError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
 import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { readProfile, writeProfile } from '../lib/credentials.js';
 import type { MeResponse } from './auth.js';
@@ -195,6 +195,12 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  // Since Vitest 3, restoreAllMocks only restores vi.spyOn spies; the vi.fn()
+  // doubles from the node:fs mock above keep any per-test mockImplementation.
+  // mockReset puts each back on its original (real fs) implementation.
+  for (const fn of [mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync]) {
+    vi.mocked(fn).mockReset();
+  }
 });
 
 describe('runInit — session-only environment credentials', () => {
@@ -362,7 +368,11 @@ describe('runInit — session-only environment credentials', () => {
         ),
       ).rejects.toBe(error);
       expect(captured.stdout).toEqual([]);
-      expect(captured.stderr).toEqual([]);
+      expect(captured.stderr).toEqual(
+        source === 'prompt'
+          ? ['Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey']
+          : [],
+      );
     },
   );
 
@@ -602,6 +612,36 @@ describe('runInit — happy path (interactive)', () => {
     const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
     expect(parsed.status).toBe('initialized');
     expect(captured.stderr.some(line => line.includes('setup identity lookup failed'))).toBe(true);
+  });
+
+  it('stops before skill installation when the identity request is interrupted', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls, mkdirCalls } = makeMemFs();
+    const interruption = new InterruptError('SIGINT');
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      if (calls === 2) throw interruption;
+      return new Response(JSON.stringify(ME), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as InitDeps['fetchImpl'];
+
+    await expect(
+      runInit(makeBaseOpts({ apiKey: 'sk-user-test' }), {
+        ...deps,
+        fetchImpl,
+        credentialsPath,
+        isTTY: false,
+        cwd: CWD,
+        fs: agentFs,
+      }),
+    ).rejects.toBe(interruption);
+    expect(calls).toBe(2);
+    expect(writeCalls).toEqual([]);
+    expect(mkdirCalls).toEqual([]);
+    expect(captured.stdout.join('\n')).not.toContain('TestSprite initialized');
   });
 });
 
@@ -1279,7 +1319,7 @@ describe('runInit — --agent cursor', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4b. Reload hint in the setup summary (DEV-279)
+// 4b. Reload hint in the setup summary
 // ---------------------------------------------------------------------------
 
 describe('runInit — reload hint', () => {
@@ -1498,6 +1538,11 @@ describe('runInit — no TTY + no key source → exit 5', () => {
     expect((thrown as CLIError).exitCode).toBe(5);
     const msg = (thrown as CLIError).message;
     expect(msg).toContain('--api-key');
+    expect(msg).toContain('https://www.testsprite.com/dashboard/settings/apikey');
+    expect(thrown).toMatchObject({
+      nextAction:
+        'Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+    });
   });
 });
 

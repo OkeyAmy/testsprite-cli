@@ -50,6 +50,7 @@ import type {
   CliGeneratePlansResponse,
   CliGetPlansResponse,
 } from '../plans.types.js';
+import type { TunnelListResponse, TunnelStatusResponse } from '../tunnel.types.js';
 
 const SAMPLE_USER_ID = '11111111-1111-4111-8111-111111111111';
 const SAMPLE_KEY_ID = 'key_dryrun_2026';
@@ -62,6 +63,8 @@ const SAMPLE_TEST_ID_BLOCKED = 'test_blocked_4f7a';
 export const SAMPLE_RUN_ID = 'run_abc';
 const SAMPLE_SCHEDULE_ID = 'sch_7d21ac48';
 const SAMPLE_SCHEDULE_RUN_ID = 'exec_5c08f1b2';
+const SAMPLE_TUNNEL_ID_1 = '00000000-0000-4000-8000-000000000001';
+const SAMPLE_TUNNEL_ID_2 = '00000000-0000-4000-8000-000000000002';
 // Documented sentinel for `test steps --run-id run_failed_sample --dry-run`:
 // keeps wait flows on the default passed sample while still demonstrating a
 // run-scoped failed step offline.
@@ -550,10 +553,34 @@ export interface DryRunSampleEntry {
 
 const PATH_PREFIX = '/api/cli/v1';
 
+// Regex metacharacters that must be escaped when a literal string is spliced
+// into a `new RegExp(...)` source string, so the literal matches only itself.
+const REGEXP_METACHAR = /[.*+?^${}()|[\]\\]/g;
+
+function escapeRegExpLiteral(literal: string): string {
+  return literal.replace(REGEXP_METACHAR, '\\$&');
+}
+
+/**
+ * Build the matcher RegExp for a route template, e.g.
+ * `/tests/{testId}/code` → /^\/tests\/[^/]+\/code$/. Splits on the
+ * `{param}` placeholders first, then regex-escapes every literal segment in
+ * between (including any literal backslash) so a route literal containing a
+ * regex metacharacter is matched literally instead of being reinterpreted as
+ * part of the pattern.
+ */
+function buildPathPattern(pathTemplate: string): RegExp {
+  const regexSrc = pathTemplate
+    .split(/(\{[^}]+\})/g)
+    .map(part => (/^\{[^}]+\}$/.test(part) ? '[^/]+' : escapeRegExpLiteral(part)))
+    .join('');
+  return new RegExp(`^${regexSrc}$`);
+}
+
 const ENTRIES: DryRunSampleEntry[] = [
   entry('whoami', 'GET', '/me', me),
   entry('listProjects', 'GET', '/projects', pageOf(projects)),
-  // DEV-384 V3-B — plan-generation surface. All three MUST be registered
+  // Plan-generation surface. All three MUST be registered
   // BEFORE `getProject`: findSample is first-match-wins and the projects/*
   // family shares the `/projects/…` prefix, so the more specific plans
   // paths are listed first (same defensive convention as `/tests/{id}/runs`
@@ -626,7 +653,7 @@ const ENTRIES: DryRunSampleEntry[] = [
       caseKeys: ids.map(id => `case_dryrun_${id}`),
     } satisfies CliAcceptPlansResponse;
   }),
-  // DEV-384 piece V3-D — `project docs upload` two-step facade routes.
+  // `project docs upload` two-step facade routes.
   // Registered BEFORE the broader project patterns (design doc §7 ordering
   // rule; findSample is first-match-wins) and with `/docs/upload-url` before
   // `/docs`. NOT consumed by the command's dry-run path: `project docs
@@ -979,7 +1006,7 @@ const ENTRIES: DryRunSampleEntry[] = [
   // returning status: "failed" for `test wait --dry-run`.
   entry('getRun', 'GET', `/runs/${SAMPLE_FAILED_RUN_ID}`, failedRunSample),
   entry('getRun', 'GET', '/runs/{runId}', passedRunSample),
-  // DEV-331 piece 3 — POST /runs/{runId}/cancel. Method-guarded in
+  // POST /runs/{runId}/cancel. Method-guarded in
   // `findSample` (POST vs `getRun`'s GET), so this can't be shadowed by the
   // broader `/runs/{runId}` pattern above despite sharing its path prefix.
   // `alreadyCancelled: false` — a fresh cancel is the more instructive shape
@@ -1038,6 +1065,27 @@ const ENTRIES: DryRunSampleEntry[] = [
   entry('deleteSchedule', 'DELETE', '/schedules/{scheduleId}', {
     scheduleId: SAMPLE_SCHEDULE_ID,
   }),
+  entry('listTunnels', 'GET', '/tunnel', {
+    tunnels: [
+      {
+        clientId: SAMPLE_TUNNEL_ID_1,
+        status: 'online',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        expiresAt: '2026-01-01T01:00:00.000Z',
+      },
+      {
+        clientId: SAMPLE_TUNNEL_ID_2,
+        status: 'offline',
+        createdAt: null,
+        expiresAt: '2026-01-01T02:00:00.000Z',
+      },
+    ],
+  } satisfies TunnelListResponse),
+  entry('getTunnelStatus', 'GET', '/tunnel/{clientId}', {
+    clientId: SAMPLE_TUNNEL_ID_1,
+    status: 'online',
+    expiresAt: '2026-01-01T01:00:00.000Z',
+  } satisfies TunnelStatusResponse),
 ];
 
 function entry(
@@ -1046,15 +1094,13 @@ function entry(
   pathTemplate: string,
   body: unknown | ((requestBody?: unknown) => unknown),
 ): DryRunSampleEntry {
-  // Convert `/tests/{testId}/code` → /^\/tests\/[^/]+\/code$/
-  const regexSrc = pathTemplate.replace(/\{[^}]+\}/g, '[^/]+').replace(/\//g, '\\/');
   const bodyFn =
     typeof body === 'function' ? (body as (requestBody?: unknown) => unknown) : () => body;
   return {
     operationId,
     method,
     pathTemplate,
-    pattern: new RegExp(`^${regexSrc}$`),
+    pattern: buildPathPattern(pathTemplate),
     body: bodyFn,
   };
 }
@@ -1085,7 +1131,7 @@ function pageOf<T>(items: T[]): Page<T> {
  * `undefined`. For dry-run paths that resolve samples DIRECTLY (bypassing the
  * dry-run fetch impl, which has its own loud INTERNAL envelope for this):
  * without the throw, a lost registry entry surfaces as a raw TypeError deep
- * in a renderer (DEV-384 review F6 — `samples.ts` is a real merge-conflict
+ * in a renderer (`samples.ts` is a real merge-conflict
  * hotspot, so a silently dropped entry is a live hazard, not a hypothetical).
  */
 export function findSampleOrThrow(
@@ -1143,3 +1189,6 @@ function extractPath(url: string): string {
 
 /** Test-only export so `samples.test.ts` can iterate the catalog. */
 export const DRY_RUN_SAMPLE_ENTRIES: ReadonlyArray<DryRunSampleEntry> = ENTRIES;
+
+/** Test-only export so `samples.test.ts` can verify the route-template matcher directly. */
+export const buildDryRunPathPattern = buildPathPattern;

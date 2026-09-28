@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -461,16 +461,21 @@ describe('recordOutcome', () => {
 
   it('uses pre-resolved auth and never reads the credentials file', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(okResponse());
-    await recordOutcome(base, {
-      env: {},
-      // Bogus path: if it were read, no key would resolve and the POST would skip.
-      credentialsPath: join(tmpdir(), 'cli-telemetry-missing', 'credentials'),
-      resolvedAuth: { apiKey: 'sk-user-pre', apiUrl: 'https://api.example.com' },
-      fetchImpl,
-    });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
-    expect((init.headers as Record<string, string>)['x-api-key']).toBe('sk-user-pre');
+    // Bogus path: if it were read, no key would resolve and the POST would skip.
+    const missingCredsDir = mkdtempSync(join(tmpdir(), 'cli-telemetry-missing-'));
+    try {
+      await recordOutcome(base, {
+        env: {},
+        credentialsPath: join(missingCredsDir, 'credentials'),
+        resolvedAuth: { apiKey: 'sk-user-pre', apiUrl: 'https://api.example.com' },
+        fetchImpl,
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+      expect((init.headers as Record<string, string>)['x-api-key']).toBe('sk-user-pre');
+    } finally {
+      rmSync(missingCredsDir, { recursive: true, force: true });
+    }
   });
 
   it('skips when the pre-resolved auth carries no api-key', async () => {
@@ -702,6 +707,17 @@ describe('hashRepository / buildCiContext', () => {
 // ---------------------------------------------------------------------------
 
 describe('sanitizeTelemetryExtras', () => {
+  it('drops target URL fields and the retired legacy marker', () => {
+    expect(
+      sanitizeTelemetryExtras({
+        legacyTargetUrlUsed: true,
+        targetUrl: 'https://secret.example',
+        url: 'https://secret.example',
+      }),
+    ).toEqual({});
+    expect(sanitizeTelemetryExtras({ legacyTargetUrlUsed: 'true' })).toEqual({});
+  });
+
   it('keeps allowlisted keys of the right shape and drops everything else', () => {
     expect(
       sanitizeTelemetryExtras({
@@ -751,6 +767,13 @@ describe('sanitizeTelemetryExtras', () => {
     expect(sanitizeTelemetryExtras({ conflictReason: 'not_found' })).toEqual({});
     expect(sanitizeTelemetryExtras({ conflictReason: 'tunnel-required' })).toEqual({
       conflictReason: 'tunnel-required',
+    });
+    // Both spellings of a paused workspace: the gate's name and the deprecated one.
+    expect(sanitizeTelemetryExtras({ conflictReason: 'paused' })).toEqual({
+      conflictReason: 'paused',
+    });
+    expect(sanitizeTelemetryExtras({ conflictReason: 'billing_hold' })).toEqual({
+      conflictReason: 'billing_hold',
     });
     expect(sanitizeTelemetryExtras({ platform: 'gitlab' })).toEqual({});
     expect(sanitizeTelemetryExtras({ projectResolved: 'guess' })).toEqual({});

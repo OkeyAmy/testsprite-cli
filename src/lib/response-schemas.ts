@@ -55,7 +55,11 @@ import type {
   TriggerRunResponse,
 } from './runs.types.js';
 import type { CliTestListRunResponse } from './testlist.types.js';
-import type { TunnelMintResponse, TunnelStatusResponse } from './tunnel.types.js';
+import type {
+  TunnelListResponse,
+  TunnelMintResponse,
+  TunnelStatusResponse,
+} from './tunnel.types.js';
 import type { ConflictReason } from './conflict-reason.js';
 
 /** Deployment environment the bound key belongs to; open on the wire (rule 2). */
@@ -213,6 +217,12 @@ export const TRIGGER_RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, TriggerRunRes
     enqueuedAt: v.string(),
     codeVersion: v.string(),
     targetUrl: v.string(),
+    // Optional with NO default (rule 3). The default must stay
+    // absent: `undefined` here means "this backend predates the field and
+    // stripped what we sent", which is precisely what the opt-out advisory
+    // keys on. Defaulting it to `false` would make an old backend look like
+    // it had honoured `--no-auto-heal`.
+    autoHeal: v.optional(v.boolean()),
     // The run's environment — optional with no default (rule 3, optional branch).
     environment: OPTIONAL_ENVIRONMENT_SCHEMA,
     // Server-built portal links (backend ≥ the run-links change). Optional
@@ -287,8 +297,17 @@ export const BATCH_RERUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, BatchRerunRes
     ),
     // Mirrors BatchRerunDeferred (runs.types.ts).
     deferred: v.array(v.looseObject({ testId: v.string(), reason: v.string() })),
-    // Mirrors BatchRerunConflict (runs.types.ts).
-    conflicts: v.array(v.looseObject({ testId: v.string(), currentRunId: v.string() })),
+    // Mirrors BatchRerunConflict (runs.types.ts). `currentRunId` is optional,
+    // as in the two schemas below: a refusal only carries a run id when there
+    // is a run to point at.
+    conflicts: v.array(
+      v.looseObject({
+        testId: v.string(),
+        currentRunId: v.optional(v.string()),
+        reason: v.optional(v.string()) as v.GenericSchema<unknown, ConflictReason | undefined>,
+        message: v.optional(v.string()),
+      }),
+    ),
     // Mirrors BatchRerunClosure / BatchRerunClosureByProject (runs.types.ts).
     closure: v.looseObject({
       byProject: v.array(
@@ -316,6 +335,8 @@ export const BATCH_RERUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, BatchRerunRes
 /** Mirrors `BatchRunFreshResponse` (runs.types.ts): `POST /tests/batch/run`. */
 export const BATCH_RUN_FRESH_RESPONSE_SCHEMA: v.GenericSchema<unknown, BatchRunFreshResponse> =
   v.looseObject({
+    // See TRIGGER_RUN_RESPONSE_SCHEMA; absence carries the same meaning.
+    autoHeal: v.optional(v.boolean()),
     // Mirrors BatchRunFreshAccepted (runs.types.ts); dashboardUrl is
     // client-synthesized, tolerated as optional.
     accepted: v.array(
@@ -342,6 +363,8 @@ export const BATCH_RUN_FRESH_RESPONSE_SCHEMA: v.GenericSchema<unknown, BatchRunF
     // keeps computing its legacy template for an older backend / the V2 engine;
     // `null` passes through as a present key meaning "no correct page".
     dashboardUrl: v.nullish(v.string(), undefined),
+    // An exact echo confirms that the backend read the target URL override.
+    targetUrl: v.optional(v.string()),
   });
 
 /**
@@ -403,6 +426,10 @@ export const LIST_RUNS_RESPONSE_SCHEMA: v.GenericSchema<unknown, ListRunsRespons
     historyStartsAt: v.optional(v.string()),
     note: v.optional(v.string()),
     portalUrl: v.optional(v.string()),
+    tier: v.optional(v.string()),
+    retentionDays: v.optional(v.nullable(v.number())),
+    hiddenCount: v.optional(v.number()),
+    billingUrl: v.optional(v.string()),
   }),
 });
 
@@ -519,7 +546,7 @@ export const USAGE_RESPONSE_SCHEMA: v.GenericSchema<unknown, UsageResponse> = v.
 });
 
 // ---------------------------------------------------------------------------
-// /tunnel — DEV-747 piece 1 facade
+// /tunnel facade
 // ---------------------------------------------------------------------------
 
 /**
@@ -547,4 +574,17 @@ export const TUNNEL_STATUS_RESPONSE_SCHEMA: v.GenericSchema<unknown, TunnelStatu
     clientId: v.string(),
     status: openWireLiteral<'online' | 'offline'>(),
     expiresAt: v.string(),
+  });
+
+/** Mirrors `TunnelListResponse`: a server may add status values or omit creation time. */
+export const TUNNEL_LIST_RESPONSE_SCHEMA: v.GenericSchema<unknown, TunnelListResponse> =
+  v.looseObject({
+    tunnels: v.array(
+      v.looseObject({
+        clientId: v.string(),
+        status: openWireLiteral<'online' | 'offline' | 'unknown'>(),
+        expiresAt: v.string(),
+        createdAt: v.optional(v.nullable(v.string())),
+      }),
+    ),
   });

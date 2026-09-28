@@ -48,7 +48,10 @@ function run(flags: string[], command = ['project', 'create', '--name', 'Local a
   );
 }
 
-describe('local project admission through the CLI entry', () => {
+// Every case spawns the built CLI with a 10 s ceiling (`run` above). The test
+// timeout must sit above that ceiling, or a slow runner fails the test while
+// the child is still inside its own budget.
+describe('local project admission through the CLI entry', { timeout: 20_000 }, () => {
   it.each([
     ['--type', 'frontend', '--local', '3000'],
     ['--type', 'frontend', '--local', '3000', '--url', 'https://example.com'],

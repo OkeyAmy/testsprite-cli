@@ -23,17 +23,11 @@
  * repository names — `errorCode` is a stable machine code, never the human
  * message, and the CI repository is reduced to a salted, truncated hash so
  * runs from one repo can be grouped without the slug ever leaving the runner.
- * `timeoutSeconds` is the one field derived from a flag, and it is allowed
- * for a narrow, checkable reason, not a case-by-case judgment call: it is the
- * literal integer value of `--timeout`/`--request-timeout` as typed by the
- * operator — not a path, not a URL, not free text, and not derived from
- * anything the target application returned. It carries no more information
- * than `exitCode` or `durationMs` already do, and is included so a `--wait`
- * timeout is distinguishable from a genuinely slow backend (see `errorOrigin`
- * below). Anyone auditing this allowlist can verify that reasoning against
- * the two call sites that set it (`RequestTimeoutError.timeoutMs`, and the
- * `ApiError` `details.timeoutSeconds` a `--wait` deadline conversion stamps)
- * without having to trust a one-off exception.
+ * Flag-derived values are limited to bounded numeric controls:
+ * `timeoutSeconds` is the operator's timeout (not a URL or free text) and
+ * distinguishes a wait deadline from a slow backend; `localConcurrencyLimit`
+ * is an integer 1–10 and lets local batch outcomes be grouped by load.
+ * `localPeakInFlight` is the observed count, also bounded by that limit.
  *
  * `errorOrigin` ('client' | 'server') and `timeoutSeconds` are sent by this
  * revision of the CLI. The telemetry endpoint validates against an allowlist
@@ -216,6 +210,7 @@ export function buildCiContext(env: NodeJS.ProcessEnv): {
 export type TelemetryConflictReason =
   | 'in_flight'
   | 'insufficient_credits'
+  | 'paused'
   | 'billing_hold'
   | 'mcp_view_only'
   | 'local_address'
@@ -238,6 +233,9 @@ export interface TelemetryExtras {
   failed?: number;
   blocked?: number;
   timedOut?: number;
+  /** Local tunnel pool limit (1–10) and observed peak, without ids or target details. */
+  localConcurrencyLimit?: number;
+  localPeakInFlight?: number;
   /** The most frequent conflict reason of the batch. */
   conflictReason?: TelemetryConflictReason;
   /** `ci init` facts. */
@@ -259,6 +257,8 @@ const COUNT_KEYS = [
   'failed',
   'blocked',
   'timedOut',
+  'localConcurrencyLimit',
+  'localPeakInFlight',
 ] as const;
 const BOOLEAN_KEYS = ['force', 'workflowExisted'] as const;
 const ENUM_KEYS: { [K in 'conflictReason' | 'platform' | 'projectResolved']: ReadonlySet<string> } =
@@ -266,6 +266,7 @@ const ENUM_KEYS: { [K in 'conflictReason' | 'platform' | 'projectResolved']: Rea
     conflictReason: new Set<TelemetryConflictReason>([
       'in_flight',
       'insufficient_credits',
+      'paused',
       'billing_hold',
       'mcp_view_only',
       'local_address',
@@ -562,8 +563,11 @@ export function resolveTelemetryAuth(
   opts: { profile?: string; endpointUrl?: string },
   deps: { env?: NodeJS.ProcessEnv; credentialsPath?: string } = {},
 ): ResolvedTelemetryAuth {
+  // No `?? 'default'`: `loadConfig` resolves the documented
+  // flag > TESTSPRITE_PROFILE > default order from the same env, and a
+  // pre-collapsed string here would hide the env var from it.
   const config = loadConfig({
-    profile: opts.profile ?? 'default',
+    profile: opts.profile,
     endpointUrl: opts.endpointUrl,
     env: deps.env ?? process.env,
     credentialsPath: deps.credentialsPath ?? defaultCredentialsPath(),
@@ -600,7 +604,7 @@ export async function recordOutcome(
     const config =
       deps.resolvedAuth ??
       loadConfig({
-        profile: input.profile ?? 'default',
+        profile: input.profile,
         endpointUrl: input.endpointUrl,
         env,
         credentialsPath: deps.credentialsPath ?? defaultCredentialsPath(),

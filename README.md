@@ -61,7 +61,7 @@ npm install -g @testsprite/testsprite-cli
 testsprite setup
 ```
 
-`testsprite setup` prompts for your [API key](https://www.testsprite.com), verifies it, and installs the verification-loop skill for the coding agents this project uses — one command, so your agent is wired to verify its own work.
+`testsprite setup` prompts for your [API key](https://www.testsprite.com/dashboard/settings/apikey), verifies it, and installs the verification-loop skill for the coding agents this project uses — one command, so your agent is wired to verify its own work.
 
 **Which agent it installs for.** Each of the eight supported targets — `claude`, `cursor`, `cline`, `windsurf`, `antigravity`, `kiro`, `copilot`, `codex` — lands its skill in a different place, so `setup` works out which you use: the agent calling it, if it identifies itself, together with every agent whose config is already in the project. It installs for all of them and prints what it found — in a terminal it shows you that list first, so you can accept it or narrow it before anything is written. If nothing identifies an agent, it installs for `claude` and says so — that is the one case where you want `--agent <target>` to name one yourself. Check the result any time with `testsprite agent status`.
 
@@ -136,18 +136,25 @@ Use an API key with `run:tunnel`: keys minted before that scope existed need to 
 ```bash
 testsprite project create --type frontend --name "My local app" --local 3000
 testsprite test create --plan-from ./checkout.plan.json --project <project-id>
-testsprite test run <test-id> --local 3000  # per-run tunnel; waits up to 1200 seconds
+testsprite test run <test-id> --local 3000  # waits up to 1200 seconds
+testsprite test run <id> <id> --local 3000 --max-concurrency 5
+testsprite test run --all --project <project-id> --local 3000
 # Or keep one tunnel open in terminal A (no port argument)
 testsprite tunnel start --ttl 3600
 # Terminal B: borrow the clientId printed above; keep terminal A running
 testsprite test run <test-id> --local 3000 --tunnel-client <client-uuid>
+testsprite tunnel list
+testsprite tunnel stop <client-uuid>
+# Stop every live tunnel on this account only when you intend to revoke them all
+testsprite tunnel stop --all --confirm
 ```
 
-Run one test per invocation; parallel invocations are fine (5 live tunnel bindings per user); `--all --local` is refused.
+Run several local frontend tests in one invocation to share one tunnel binding. The batch runs up to 5 tests at once by default; `--max-concurrency` accepts 1–10. `--all --local` skips backend tests. An owned batch cancels unfinished runs on Ctrl-C or tunnel loss; JSON output lists every requested test in input order, including tests that did not start. The minted client id is printed before the tunnel connects.
+Hit the tunnel limit? Run `testsprite tunnel list`, then `testsprite tunnel stop <client-uuid>` for an unused binding, or `testsprite tunnel stop --all --confirm` to revoke them all. An older server without listing returns exit 4; a key without `run:tunnel` returns exit 3.
 A second `tunnel start` or process using the same credential takes over, and the first exits **10**.
 The examples use `127.0.0.1`. For another loopback listener, pass the same `--local-host localhost` or `--local-host ::1` to project creation and every follow-up run. The selected host is stored in the project URL (`::1` becomes `http://[::1]:<port>`); `project get/list` exposes `originMode: 'local'` in JSON and shows `(Local)` in text output.
 The control plane is WebSocket over TLS (`wss://control.tun.testsprite.com/ws`). The data plane, which carries the tunnel secret and proxied traffic, uses TLS at `data.tun.testsprite.com:443` and verifies the certificate with Node's default trust store: its bundled Mozilla roots, plus certificates supplied through `NODE_EXTRA_CA_CERTS` and the system CAs when Node is started with `--use-system-ca`. Node 20 is supported without losing `NODE_EXTRA_CA_CERTS`. Verification cannot be disabled, and the CLI never falls back from TLS to plaintext. On a network that re-signs TLS, export your organisation's root CA to a PEM file and set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` before running `testsprite`. Plaintext connects and TLS handshakes each time out after 10 seconds. The first failed attempt starts a **60-second** retry episode; writing `TunnelHello` is not enough to reset it. The episode ends only after the first inbound tunnel stream or after the socket remains open for 5 seconds following the hello. A real deadline timer stays armed across retries and destroys an in-flight socket when it expires. After that, an owned `test run --local` run is cancelled and refunded and the command exits **10**; `tunnel start` exits **10**. If a self-hosted or older TestSprite server does not advertise a TLS endpoint, the CLI prints a one-time warning and uses legacy plaintext port **7400** under the same timeout and retry rules. `tunnel start` prints `transport: tls` or `transport: plaintext`.
-An owned tunnel's timeout or Ctrl-C cancels the run by default. A borrowed run still detaches without cancellation on Ctrl-C/SIGTERM because its owner keeps the tunnel alive; if that owner disappears while the run is active, the borrower cancels its own run and reports `cancelled`, `already finished`, or `skipped`. A run cancelled before it finishes is refunded. `--no-cancel-on-interrupt` also skips this owner-gone cancellation. Keep the early `Run <runId>` receipt on stderr and read the reported run before re-running.
+An owned tunnel's timeout or Ctrl-C cancels unfinished runs by default. A borrowed run still detaches without cancellation on Ctrl-C/SIGTERM because its owner keeps the tunnel alive; if that owner disappears while a run is active, the borrower cancels its own run and reports `cancelled`, `already finished`, or `skipped`. A run cancelled before it finishes is refunded. `--no-cancel-on-interrupt` also skips this owner-gone cancellation. Keep the early stderr run-id receipts (`Run <runId>` for one test, `[i/N] <testId> → run <runId>` for a batch) and read the reported runs before re-running.
 Local projects skip exploration/plan generation; author plans with `test create --plan-from`. Portal runs are blocked for free until you set a public project URL.
 See [the full local-testing reference](./DOCUMENTATION.md#local-frontend-testing-and-tunnels) for flags, login, billing/refunds, timeouts, and retargeting.
 

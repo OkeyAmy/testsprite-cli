@@ -847,7 +847,7 @@ describe('R-FE2: auto-heal forwarded for FE paid', () => {
 
 // R-FE0: default-on — no --no-auto-heal flag → body sends autoHeal:true; advisory emitted
 describe('R-FE0: auto-heal default-on (no --no-auto-heal flag)', () => {
-  it('sends autoHeal:true by default; emits 0.2-credit advisory when server echoes autoHeal:true', async () => {
+  it('sends autoHeal:true by default; advisory names the re-authoring when server echoes autoHeal:true', async () => {
     const creds = makeCreds();
     const rerunResp = makeFeRerunResp({ autoHeal: true }); // server confirms auto-heal
     const stderrLines: string[] = [];
@@ -890,11 +890,16 @@ describe('R-FE0: auto-heal default-on (no --no-auto-heal flag)', () => {
     // Body must include autoHeal:true
     expect((sentBody as { autoHeal?: boolean }).autoHeal).toBe(true);
 
-    // Advisory must mention 0.2 credit and --no-auto-heal
+    // The advisory must name the CONSEQUENCE (the stored code is replaced) and
+    // the opt-out. It deliberately no longer quotes a credit figure: that number
+    // was the legacy V2 engage fee, and on V3 — now the majority of CLI volume —
+    // a heal is a full agent run billed as the run, with no extra charge at all
+    // (verified against `billing-pricing.ts`, which has no auto-heal action).
     const advisory = stderrLines.find(
-      l => l.includes('[advisory]') && l.includes('0.2') && l.includes('--no-auto-heal'),
+      l => l.includes('[advisory]') && l.includes('re-authors') && l.includes('--no-auto-heal'),
     );
     expect(advisory).toBeDefined();
+    expect(advisory).not.toContain('0.2');
   });
 });
 
@@ -1418,6 +1423,41 @@ describe('R-BE2: --skip-dependencies', () => {
 // ---------------------------------------------------------------------------
 
 describe('R-BE3: auto-heal on BE test — default-on suppresses warning', () => {
+  it('does not dispatch a rerun after the type lookup is interrupted', async () => {
+    const creds = makeCreds();
+    const interruption = new InterruptError('SIGINT');
+    let dispatched = false;
+    const fetchImpl = makeFetch((_url, init) => {
+      if (init.method === 'POST') {
+        dispatched = true;
+        return { body: makeBeRerunResp({ autoHeal: false }) };
+      }
+      throw interruption;
+    });
+
+    await expect(
+      runTestRerun(
+        {
+          testIds: ['test_be_consumer_01'],
+          all: false,
+          wait: false,
+          timeoutSeconds: 600,
+          autoHeal: true,
+          autoHealExplicit: false,
+          skipDependencies: false,
+          maxConcurrency: 10,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, sleep: instantSleep, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toBe(interruption);
+    expect(dispatched).toBe(false);
+  });
+
   it('auto-heal defaults true; BE type suppresses warning (autoHealExplicit:false); autoHeal:false sent explicitly', async () => {
     const creds = makeCreds();
     const rerunResp = makeBeRerunResp({ autoHeal: false });
@@ -3035,6 +3075,52 @@ describe('[fix-C] batch rerun: every test in-flight → CONFLICT exit 6', () => 
     expect((err as ApiError).message).toContain('already in flight');
   });
 
+  it('an all-billing_hold batch rerun exits 13 FEATURE_GATED, matching test run --all', async () => {
+    const creds = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/rerun'))
+        return {
+          status: 202,
+          body: {
+            accepted: [],
+            deferred: [],
+            conflicts: [
+              { testId: 'test_1', reason: 'billing_hold', message: 'Workspace paused.' },
+              { testId: 'test_2', reason: 'billing_hold', message: 'Workspace paused.' },
+            ],
+            closure: { byProject: [] },
+          },
+        };
+      return errorBody('NOT_FOUND');
+    });
+    const err = (await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl },
+    ).catch(e => e)) as ApiError;
+    // Was a bare CONFLICT (exit 6, "already in flight") before this fix —
+    // a paused workspace is never resolved by waiting, so it must exit the same way a
+    // paused-workspace `test run --all` batch does.
+    expect(err.code).toBe('FEATURE_GATED');
+    expect(err.exitCode).toBe(13);
+    expect(err.message).toContain('Workspace paused');
+    expect(err.message).not.toContain('already in flight');
+    expect(err.nextAction).toContain('/dashboard/settings/billing');
+  });
+
   it('partial conflict (some accepted + some conflicts) still exits 0 on all-passed', async () => {
     const creds = makeCreds();
     const partialConflictResp: BatchRerunResponse = {
@@ -3527,9 +3613,12 @@ describe('[fix-D] --all resolves >50 tests: chunked batch requests, aggregated r
     );
 
     expect(batchCallCount).toBe(2);
-    expect(
-      stderrLines.some(l => l.includes('triggered more than once') && l.includes('1 test')),
-    ).toBe(true);
+    // The second chunk's producer run is real, executing, and unpolled — the
+    // warning has to name its id, not just count it.
+    const warned = stderrLines.join('\n');
+    expect(warned).toContain('1 duplicate dispatch');
+    expect(warned).toContain('polling run_producer_call1, not polling run_producer_call2');
+    expect(warned).toContain('testsprite test cancel <run-id>');
   });
 });
 
@@ -5861,10 +5950,67 @@ describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON t
 });
 
 // ---------------------------------------------------------------------------
-// DEV-331 piece 1 — graceful detach during batch rerun --wait (SIG-6)
+// Graceful detach during batch rerun --wait
 // ---------------------------------------------------------------------------
 
-describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatched runIds (DEV-331)', () => {
+describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatched runIds', () => {
+  it('marks a dispatched rerun for recovery guidance on fan-out interruption', async () => {
+    const creds = makeCreds();
+    const interruption = new InterruptError('SIGINT');
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).includes('/tests/batch/rerun')) {
+        return new Response(
+          JSON.stringify({
+            accepted: [
+              { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+              { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+            ],
+            deferred: [],
+            conflicts: [],
+            closure: { byProject: [] },
+          }),
+          { status: 202 },
+        );
+      }
+      throw interruption;
+    }) as FetchImpl;
+    const error = await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 30,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 1,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        fetchImpl,
+        shutdown: new ShutdownController(),
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+      },
+    ).catch((err: unknown) => err);
+    expect(error).toBe(interruption);
+    expect((error as InterruptError).runWaitContext).toBe(true);
+    expect(JSON.parse(stdout.at(-1)!) as unknown).toMatchObject({
+      accepted: [
+        { testId: 'test_1', runId: 'run_b1', status: 'running' },
+        { testId: 'test_2', runId: 'run_b2', status: 'running' },
+      ],
+    });
+    expect(stderr.join('\n')).toContain('testsprite test wait run_b1');
+  });
+
   it('interrupt mid fan-out → stdout partial covers every accepted runId, honest stderr, exit 130', async () => {
     const creds = makeCreds();
     const shutdown = new ShutdownController();
@@ -5938,8 +6084,9 @@ describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatc
     const err = await pending.catch(e => e);
     expect(err).toBeInstanceOf(InterruptError);
     expect((err as InterruptError).exitCode).toBe(130);
+    expect((err as InterruptError).runWaitContext).toBe(true);
 
-    // SIG-6: the partial lists ALL dispatched runIds, marked running.
+    // The partial lists ALL dispatched runIds, marked running.
     const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
       accepted: Array<{ runId: string; status: string }>;
     };
@@ -6162,10 +6309,10 @@ describe('rerun --gh-output / --summary-file require a batch --wait (Gap B guard
 });
 
 // ---------------------------------------------------------------------------
-// DEV-1305 — `test rerun --env <name>`
+// `test rerun --env <name>`
 // ---------------------------------------------------------------------------
 
-describe('runTestRerun — --env (DEV-1305)', () => {
+describe('runTestRerun — --env', () => {
   const ME_ON = { userId: 'u_1' };
 
   interface Seen {

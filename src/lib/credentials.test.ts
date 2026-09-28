@@ -6,9 +6,11 @@ import {
   existsSync,
   mkdirSync,
   utimesSync,
+  unlinkSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type * as NodeFs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_PROFILE,
@@ -23,6 +25,15 @@ import {
   writeProfile,
 } from './credentials.js';
 import { ApiError } from './errors.js';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof NodeFs>();
+  return {
+    ...actual,
+    writeFileSync: vi.fn(actual.writeFileSync),
+    unlinkSync: vi.fn(actual.unlinkSync),
+  };
+});
 
 let tmpRoot: string;
 let credentialsPath: string;
@@ -144,6 +155,149 @@ describe('readCredentialsFile / readProfile', () => {
 });
 
 describe('writeProfile', () => {
+  it.each(['EPERM', 'EBUSY', 'EACCES'] as const)(
+    'retries a transient %s while creating the lock on Windows',
+    code => {
+      const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+      const actualWrite = vi.mocked(writeFileSync).getMockImplementation()!;
+      const lockPath = `${credentialsPath}.lock`;
+      const transient = Object.assign(new Error('lock temporarily inaccessible'), { code });
+      vi.mocked(writeFileSync).mockImplementationOnce((...args) => {
+        expect(args[0]).toBe(lockPath);
+        throw transient;
+      });
+      Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+      try {
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+        expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- `lockPath`/`credentialsPath` live in this suite's `mkdtempSync` temp dir, never user input; asserting on them is the point of the test
+        expect(existsSync(lockPath)).toBe(false);
+        expect(
+          vi.mocked(writeFileSync).mock.calls.filter(call => call[0] === lockPath),
+        ).toHaveLength(2);
+      } finally {
+        Object.defineProperty(process, 'platform', originalPlatform);
+        vi.mocked(writeFileSync).mockImplementation(actualWrite);
+      }
+    },
+  );
+
+  it('surfaces lock-create EPERM on non-Windows hosts', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const actualWrite = vi.mocked(writeFileSync).getMockImplementation()!;
+    const error = Object.assign(new Error('lock permission denied'), { code: 'EPERM' });
+    vi.mocked(writeFileSync).mockImplementationOnce(() => {
+      throw error;
+    });
+    Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'linux' });
+    try {
+      expect(() =>
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath }),
+      ).toThrow(error);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `lockPath`/`credentialsPath` live in this suite's `mkdtempSync` temp dir, never user input; asserting on them is the point of the test
+      expect(existsSync(credentialsPath)).toBe(false);
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(writeFileSync).mockImplementation(actualWrite);
+    }
+  });
+
+  it('retries a transient Windows lock-release error without losing the saved profile', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const actualUnlink = vi.mocked(unlinkSync).getMockImplementation()!;
+    const lockPath = `${credentialsPath}.lock`;
+    vi.mocked(unlinkSync).mockImplementationOnce(path => {
+      expect(path).toBe(lockPath);
+      throw Object.assign(new Error('lock delete pending'), { code: 'EPERM' });
+    });
+    Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+    try {
+      writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+      expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `lockPath`/`credentialsPath` live in this suite's `mkdtempSync` temp dir, never user input; asserting on them is the point of the test
+      expect(existsSync(lockPath)).toBe(false);
+      expect(vi.mocked(unlinkSync).mock.calls.filter(call => call[0] === lockPath)).toHaveLength(2);
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(unlinkSync).mockImplementation(actualUnlink);
+    }
+  });
+
+  it('retries a transient Windows stale-lock removal error', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const actualUnlink = vi.mocked(unlinkSync).getMockImplementation()!;
+    const lockPath = `${credentialsPath}.lock`;
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same suite temp dir; planting a lock body is how this test sets up contention
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: process.pid, createdAt: Date.now() - 60_000, token: 'stale' })}\n`,
+    );
+    vi.mocked(unlinkSync).mockImplementationOnce(path => {
+      expect(path).toBe(lockPath);
+      throw Object.assign(new Error('lock delete pending'), { code: 'EACCES' });
+    });
+    Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+    try {
+      writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+      expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `lockPath`/`credentialsPath` live in this suite's `mkdtempSync` temp dir, never user input; asserting on them is the point of the test
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(unlinkSync).mockImplementation(actualUnlink);
+    }
+  });
+
+  it('surfaces a persistent Windows lock-create EPERM instead of timing out as contention', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const actualWrite = vi.mocked(writeFileSync).getMockImplementation()!;
+    const lockPath = `${credentialsPath}.lock`;
+    const denied = Object.assign(new Error('lock permission denied'), { code: 'EPERM' });
+    vi.mocked(writeFileSync).mockImplementation((...args) => {
+      if (args[0] === lockPath) throw denied;
+      return actualWrite(...args);
+    });
+    Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+    const started = Date.now();
+    try {
+      expect(() =>
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath }),
+      ).toThrow(denied);
+      // Retried for the transient window only, not the full 5 s lock wait.
+      expect(Date.now() - started).toBeLessThan(4_000);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` lives in this suite's `mkdtempSync` temp dir, never user input
+      expect(existsSync(credentialsPath)).toBe(false);
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(writeFileSync).mockImplementation(actualWrite);
+    }
+  });
+
+  it('surfaces a persistent Windows stale-lock removal error', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const actualUnlink = vi.mocked(unlinkSync).getMockImplementation()!;
+    const lockPath = `${credentialsPath}.lock`;
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same suite temp dir; planting a stale lock is how this test sets up the removal
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: process.pid, createdAt: Date.now() - 60_000, token: 'stale' })}\n`,
+    );
+    const denied = Object.assign(new Error('stale lock cannot be removed'), { code: 'EPERM' });
+    vi.mocked(unlinkSync).mockImplementation(path => {
+      if (path === lockPath) throw denied;
+      return actualUnlink(path);
+    });
+    Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+    try {
+      expect(() =>
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath }),
+      ).toThrow(denied);
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(unlinkSync).mockImplementation(actualUnlink);
+    }
+  });
+
   it('creates the file with mode 0600 and writes the profile', () => {
     writeProfile(DEFAULT_PROFILE, { apiKey: 'sk-new' }, { path: credentialsPath });
     expect(existsSync(credentialsPath)).toBe(true);

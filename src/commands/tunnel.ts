@@ -1,5 +1,5 @@
 /**
- * `testsprite tunnel start | status | stop` — DEV-747 piece 3.
+ * `testsprite tunnel start | list | status | stop`.
  *
  * The out-of-band primitive under `test run --local`, which is sugar over it.
  * Two things it buys that the sugar cannot:
@@ -21,6 +21,7 @@
 
 import { Command } from 'commander';
 import * as v from 'valibot';
+import { resolveProfileName } from '../lib/config.js';
 import type { CommonOptions, HttpClientFactory } from '../lib/client-factory.js';
 import {
   createHttpClientFactory,
@@ -29,10 +30,11 @@ import {
   parseRequestTimeoutFlag,
   resolveRequestTimeoutMs,
 } from '../lib/client-factory.js';
-import { ApiError, RequestTimeoutError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import type { HttpClient } from '../lib/http.js';
 import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
+import { renderTextTable } from '../lib/text-table.js';
 import {
   formatDataPlaneUnreachableMessage,
   formatDataPlaneUnreachableNextAction,
@@ -40,7 +42,11 @@ import {
   type TunnelClientHandle,
   type TunnelFatalReason,
 } from '../lib/tunnel-session.js';
-import type { TunnelStatusResponse } from '../lib/tunnel.types.js';
+import type {
+  TunnelListItem,
+  TunnelListResponse,
+  TunnelStatusResponse,
+} from '../lib/tunnel.types.js';
 import { TunnelClient, type TunnelClientOptions } from '../vendor/tunnel-client/index.js';
 
 export interface TunnelDeps {
@@ -61,6 +67,23 @@ export interface TunnelStartOptions extends CommonOptions {
 
 export interface TunnelClientIdOptions extends CommonOptions {
   clientId: string;
+}
+
+export interface TunnelStopOptions extends CommonOptions {
+  clientId?: string;
+  all?: boolean;
+  confirm?: boolean;
+}
+
+export interface TunnelStopResult {
+  clientId: string;
+  stopped: boolean;
+  error?: { code: string; message: string; exitCode: number };
+}
+
+export interface TunnelStopSummary {
+  results: TunnelStopResult[];
+  summary: { total: number; stopped: number; failed: number };
 }
 
 const TUNNEL_CLIENT_ID_SCHEMA = v.pipe(v.string(), v.uuid());
@@ -95,7 +118,7 @@ function makeClient(
   return makeHttpClient(opts, {
     env: deps.env,
     credentialsPath: deps.credentialsPath,
-    fetchImpl: deps.fetchImpl,
+    fetchImpl: opts.dryRun ? undefined : deps.fetchImpl,
     stderr: deps.stderr,
     shutdownSignal,
   });
@@ -318,6 +341,10 @@ export async function runTunnelStart(
           log: stderr,
           logLevel: opts.debug ? 'debug' : opts.verbose ? 'info' : 'error',
           ...(opts.ttlSeconds !== undefined ? { ttlSeconds: opts.ttlSeconds } : {}),
+          onMinted: minted =>
+            stderr(
+              `Minted tunnel client ${minted.clientId} (expires ${minted.expiresAt}); connecting…`,
+            ),
           onFatal: (reason, message) => {
             fatal = true;
             fatalReason = reason;
@@ -477,6 +504,83 @@ function renderStatus(status: TunnelStatusResponse): string {
   return lines.join('\n');
 }
 
+async function listTunnelsForAccount(
+  opts: CommonOptions,
+  deps: TunnelDeps,
+): Promise<TunnelListResponse> {
+  try {
+    return await makeClient(opts, deps).listTunnels();
+  } catch (err) {
+    if (err instanceof ApiError && err.httpStatus === 404) {
+      throw ApiError.fromEnvelope(
+        {
+          error: {
+            code: 'NOT_FOUND',
+            message: 'This TestSprite server cannot list tunnels yet.',
+            nextAction:
+              'Stop a tunnel you know the id of with `testsprite tunnel stop <client-id>`, or wait for it to expire.',
+            requestId: err.requestId,
+            details: err.details,
+          },
+        },
+        404,
+      );
+    }
+    throw err;
+  }
+}
+
+export async function runTunnelList(
+  opts: CommonOptions,
+  deps: TunnelDeps = {},
+): Promise<TunnelListResponse> {
+  const response = await listTunnelsForAccount(opts, deps);
+  makeOutput(opts.output, deps).print(response, data =>
+    renderTunnelList(data as TunnelListResponse),
+  );
+  return response;
+}
+
+function renderTunnelList(response: TunnelListResponse): string {
+  if (response.tunnels.length === 0) return 'No live tunnels.';
+  const columns = [
+    {
+      header: 'CLIENT ID',
+      width: (rows: readonly TunnelListItem[]) =>
+        Math.max(9, ...rows.map(item => item.clientId.length)),
+      render: (item: TunnelListItem) => item.clientId,
+    },
+    {
+      header: 'STATUS',
+      width: (rows: readonly TunnelListItem[]) =>
+        Math.max(6, ...rows.map(item => item.status.length)),
+      render: (item: TunnelListItem) => item.status,
+    },
+    {
+      header: 'CREATED',
+      width: (rows: readonly TunnelListItem[]) =>
+        Math.max(7, ...rows.map(item => (item.createdAt ?? '-').length)),
+      render: (item: TunnelListItem) => item.createdAt ?? '-',
+    },
+    {
+      header: 'EXPIRES',
+      width: (rows: readonly TunnelListItem[]) =>
+        Math.max(7, ...rows.map(item => item.expiresAt.length)),
+      render: (item: TunnelListItem) => item.expiresAt,
+    },
+  ];
+  return [
+    renderTextTable(response.tunnels, columns),
+    'hint        Stop one: testsprite tunnel stop <client-id>',
+    'hint        Stop all of them: testsprite tunnel stop --all --confirm',
+    ...(response.tunnels.some(item => item.status === 'unknown')
+      ? [
+          'note        "unknown" means TestSprite could not check that connection just now; the tunnel may still be up.',
+        ]
+      : []),
+  ].join('\n');
+}
+
 /**
  * Destroy a binding. Idempotent by contract — deleting an unknown or
  * already-deleted binding is a success, because the requested end state holds.
@@ -485,11 +589,123 @@ function renderStatus(status: TunnelStatusResponse): string {
  * removes the client from the tunnel server. A running `tunnel start`
  * observes the revocation on its next status check and exits.
  */
-export async function runTunnelStop(
-  opts: TunnelClientIdOptions,
-  deps: TunnelDeps = {},
-): Promise<void> {
-  assertTunnelClientId(opts.clientId);
+export async function runTunnelStop(opts: TunnelStopOptions, deps: TunnelDeps = {}): Promise<void> {
+  if (opts.clientId !== undefined && opts.all) {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Pass either a <client-id> or --all, not both.',
+        nextAction: 'Choose one tunnel to stop, or use --all --confirm.',
+        requestId: 'local',
+        details: { field: 'all', reason: 'mutually exclusive with clientId' },
+      },
+    });
+  }
+  if (opts.confirm && !opts.all) {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: '--confirm only applies with --all.',
+        nextAction: 'Remove --confirm, or use --all --confirm.',
+        requestId: 'local',
+        details: { field: 'confirm', reason: 'requires --all' },
+      },
+    });
+  }
+  if (opts.clientId === undefined && !opts.all) {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message:
+          'provide a <client-id>, or use --all --confirm to stop every tunnel on this account',
+        nextAction: 'Run testsprite tunnel list to see your tunnel client ids.',
+        requestId: 'local',
+        details: { field: 'clientId', reason: 'required unless --all is set' },
+      },
+    });
+  }
+  if (opts.all) {
+    if (!opts.confirm && !opts.dryRun) {
+      throw ApiError.fromEnvelope({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Refusing to stop every tunnel without --confirm.',
+          nextAction:
+            'This revokes every live tunnel on this account, including ones another terminal or a CI job is using — their runs lose their route to your machine. Re-run with --confirm. To see what would be stopped: testsprite tunnel list.',
+          requestId: 'local',
+          details: { field: 'confirm', reason: 'required for destructive operation' },
+        },
+      });
+    }
+    if (opts.dryRun) {
+      stderrOf(deps)(
+        "[dry-run] WARNING: the preview below uses sample data and does NOT reflect the real tunnels on this account. Run 'testsprite tunnel list' to see them.",
+      );
+    }
+    const response = await listTunnelsForAccount(opts, deps);
+    const out = makeOutput(opts.output, deps);
+    if (opts.dryRun) {
+      const requests = response.tunnels.map(item => ({
+        method: 'DELETE',
+        path: `/api/cli/v1/tunnel/${item.clientId}`,
+      }));
+      out.print({ requests }, () => requests.map(item => `${item.method} ${item.path}`).join('\n'));
+      return;
+    }
+    if (response.tunnels.length === 0) {
+      out.print(
+        { results: [], summary: { total: 0, stopped: 0, failed: 0 } },
+        () => 'No live tunnels — nothing to stop.',
+      );
+      return;
+    }
+    const client = makeClient(opts, deps);
+    const results: TunnelStopResult[] = [];
+    for (const item of response.tunnels) {
+      try {
+        // Sequential and one id at a time, with the HTTP layer's normal retries:
+        // the delete is idempotent, so a transient failure is worth retrying.
+        await client.deleteTunnel(item.clientId);
+        results.push({ clientId: item.clientId, stopped: true });
+      } catch (err) {
+        if (err instanceof InterruptError) throw err;
+        const failure = err instanceof CLIError ? err : new CLIError(String(err), 1);
+        results.push({
+          clientId: item.clientId,
+          stopped: false,
+          error: {
+            code: failure.code,
+            message: failure.message,
+            exitCode: failure.exitCode,
+          },
+        });
+      }
+    }
+    const stopped = results.filter(result => result.stopped).length;
+    const bulk: TunnelStopSummary = {
+      results,
+      summary: { total: results.length, stopped, failed: results.length - stopped },
+    };
+    out.print(bulk, () =>
+      [
+        ...results.map(result =>
+          result.stopped
+            ? `stopped  ${result.clientId}`
+            : `failed   ${result.clientId}  ${result.error?.message}`,
+        ),
+        `Stopped ${stopped} of ${results.length} tunnels.`,
+        'hint     A running `tunnel start` notices a revoked credential within ~15 s and exits.',
+      ].join('\n'),
+    );
+    if (bulk.summary.failed > 0) {
+      throw new CLIError(
+        `${bulk.summary.failed} tunnel stop${bulk.summary.failed === 1 ? '' : 's'} failed. See results for details.`,
+        1,
+      );
+    }
+    return;
+  }
+  assertTunnelClientId(opts.clientId!);
   const out = makeOutput(opts.output, deps);
   if (opts.dryRun) {
     emitDryRunBanner(stderrOf(deps));
@@ -499,7 +715,7 @@ export async function runTunnelStop(
     );
     return;
   }
-  await makeClient(opts, deps).deleteTunnel(opts.clientId);
+  await makeClient(opts, deps).deleteTunnel(opts.clientId!);
   out.print(
     { clientId: opts.clientId, deleted: true },
     () => `Tunnel credential ${opts.clientId} revoked (or already absent).`,
@@ -520,8 +736,10 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
         '\nExamples:\n' +
         '  testsprite tunnel start                                   # hold a tunnel open (Ctrl-C to stop)\n' +
         '  testsprite test run <id> --local 5173 --tunnel-client <id>\n' +
+        '  testsprite tunnel list\n' +
         '  testsprite tunnel status <id>\n' +
-        '  testsprite tunnel stop <id>\n',
+        '  testsprite tunnel stop <id>\n' +
+        '  testsprite tunnel stop --all --confirm\n',
     );
 
   tunnel
@@ -538,7 +756,8 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
     )
     .addHelpText(
       'after',
-      '\nPrints the client id to pass to `test run --local <port> --tunnel-client <id>`.\n' +
+      '\nPrints the client id to stderr as soon as it is minted, before connecting; pass it\n' +
+        'to `test run --local <port> --tunnel-client <id>`.\n' +
         '\nExit codes:\n' +
         '  0  you stopped it (Ctrl-C is the normal way to end this command)\n' +
         '  3  auth error — the key needs the `run:tunnel` scope; mint a new key\n' +
@@ -550,11 +769,28 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
       const ttlSeconds = parseTtl(cmdOpts.ttl);
       await runTunnelStart(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           ...(ttlSeconds !== undefined ? { ttlSeconds } : {}),
         },
         deps,
       );
+    });
+
+  tunnel
+    .command('list')
+    .description('List live tunnel bindings for this account')
+    .addHelpText(
+      'after',
+      '\nShows each tunnel client id, connection status, creation time and expiry.\n' +
+        '\nExit codes:\n' +
+        '  0  listed (possibly empty)\n' +
+        '  3  auth error — the key needs the `run:tunnel` scope\n' +
+        '  4  server too old to list tunnels\n' +
+        ' 10  could not reach TestSprite\n',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (_cmdOpts: unknown, command: Command) => {
+      await runTunnelList(resolveCommonOptions(command, deps.env), deps);
     });
 
   tunnel
@@ -571,31 +807,55 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (clientId: string, _cmdOpts: unknown, command: Command) => {
-      await runTunnelStatus({ ...resolveCommonOptions(command), clientId }, deps);
+      await runTunnelStatus({ ...resolveCommonOptions(command, deps.env), clientId }, deps);
     });
 
   tunnel
-    .command('stop <client-id>')
-    .description('Destroy a tunnel credential (idempotent)')
+    .command('stop [client-id]')
+    .description('Destroy one tunnel credential or stop every live tunnel')
+    .option('--all', 'stop every live tunnel on this account', false)
+    .option('--confirm', 'required with --all for this destructive operation', false)
     .addHelpText(
       'after',
       '\nStopping one that is already gone succeeds. Revoking the credential\n' +
-        'also makes a running `tunnel start` exit within ~15 s.\n',
+        'also makes a running `tunnel start` exit within ~15 s.\n' +
+        'Stopping all requires --confirm; --dry-run previews sample ids without it.\n' +
+        '\nExit codes:\n' +
+        '  0  stopped (or already absent), including an empty --all result\n' +
+        '  1  at least one tunnel could not be stopped\n' +
+        '  3  auth error — the key needs the `run:tunnel` scope\n' +
+        '  4  server too old to list tunnels (with --all)\n' +
+        '  5  invalid arguments or --all without --confirm\n' +
+        ' 10  could not reach TestSprite\n',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (clientId: string, _cmdOpts: unknown, command: Command) => {
-      await runTunnelStop({ ...resolveCommonOptions(command), clientId }, deps);
-    });
+    .action(
+      async (
+        clientId: string | undefined,
+        cmdOpts: { all: boolean; confirm: boolean },
+        command: Command,
+      ) => {
+        await runTunnelStop(
+          {
+            ...resolveCommonOptions(command, deps.env),
+            clientId,
+            all: cmdOpts.all,
+            confirm: cmdOpts.confirm,
+          },
+          deps,
+        );
+      },
+    );
 
   return tunnel;
 }
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,

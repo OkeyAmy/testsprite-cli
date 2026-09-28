@@ -10,6 +10,7 @@ import {
   resolveRequestTimeoutMs,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
+import { resolveProfileName } from '../lib/config.js';
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
 import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
@@ -132,7 +133,7 @@ export interface ProjectDeps {
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   localPortProbeDeps?: LocalPortProbeDeps;
-  /** Graceful-detach coordinator (DEV-331); tests inject their own. */
+  /** Graceful-detach coordinator; tests inject their own. */
   shutdown?: ShutdownHandle;
 }
 
@@ -334,8 +335,8 @@ export async function runCreate(
   }
 
   if (opts.dryRun) {
-    // DEV-247: this path returns before makeClient() fires the banner, so emit it
-    // here — otherwise the canned sample can be mistaken for a live response.
+    // This path returns before makeClient() fires the banner, so emit it here
+    // — otherwise the canned sample can be mistaken for a live response.
     emitDryRunBanner(stderr);
     const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
     // P2-6: gate idempotency-key output behind --verbose/--debug/json (matches
@@ -576,7 +577,7 @@ export async function runUpdate(
   }
 
   if (opts.dryRun) {
-    // DEV-247: emit the banner here (this path returns before makeClient() does).
+    // Emit the banner here (this path returns before makeClient() does).
     emitDryRunBanner(stderr);
     const idempotencyKey = opts.idempotencyKey ?? `cli-proj-update-${randomUUID()}`;
     if (
@@ -952,7 +953,7 @@ function renderAutoAuthText(r: CliProjectAutoAuthResponse): string {
 }
 
 // ---------------------------------------------------------------------------
-// project docs upload — DEV-384 piece V3-D
+// project docs upload
 // ---------------------------------------------------------------------------
 
 /**
@@ -980,14 +981,14 @@ const DOC_CONTENT_TYPES: Record<string, string> = {
 };
 const DEFAULT_DOC_CONTENT_TYPE = 'application/octet-stream';
 
-/** `POST /projects/{id}/docs/upload-url` response (V3-A facade). */
+/** `POST /projects/{id}/docs/upload-url` response (docs facade). */
 export interface CliDocsUploadUrlResponse {
   uploadUrl: string;
   s3Key: string;
   expiresInSeconds: number;
 }
 
-/** `POST /projects/{id}/docs` (register) response (V3-A facade). */
+/** `POST /projects/{id}/docs` (register) response (docs facade). */
 export interface CliDocsRegisterResponse {
   resourceId: string;
   displayName: string;
@@ -995,7 +996,7 @@ export interface CliDocsRegisterResponse {
   processStatus: string;
 }
 
-/** Success result — the JSON-mode stdout shape (piece V3-D scope item 3). */
+/** Success result — the JSON-mode stdout shape. */
 export interface CliDocsUploadResult {
   resourceId: string;
   displayName: string;
@@ -1030,7 +1031,7 @@ interface DocsUploadOptions extends CommonOptions {
  * source so plan generation has inputs to feed on (closes the API-project
  * cold start at `no_processed_inputs`).
  *
- * Three-step flow against the V3-A facade routes:
+ * Three-step flow against the docs facade routes:
  *
  *   1. `POST /projects/{id}/docs/upload-url` — mints a one-hour presigned
  *      S3 PUT URL plus the S3 key to register afterwards.
@@ -1157,17 +1158,17 @@ export async function runDocsUpload(
   // transfer-encoding on presigned PUTs, and Node's fetch uses the explicit
   // header to keep identity framing with a streamed body.
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
-  // DEV-384 review F3: a remote facade must mint a non-local https URL.
+  // A remote facade must mint a non-local https URL.
   assertSafePresignedUploadUrl(minted.uploadUrl, client.resolvedBaseUrl);
   // Same flag > TESTSPRITE_REQUEST_TIMEOUT_MS > default resolution (and 1-600s
   // clamp) as makeHttpClient — this leg bypasses HttpClient, so resolve here.
   const requestTimeoutMs = resolveRequestTimeoutMs(opts, deps.env ?? process.env);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
-  // DEV-384 review F14b: compose the shutdown signal into the PUT abort
-  // (manual listeners, house style — no AbortSignal.any) and arm the
-  // graceful scope for the upload's duration, so Ctrl-C during a long PUT
-  // takes the honest DEV-331 detach path instead of being unabortable.
+  // Compose the shutdown signal into the PUT abort (manual listeners, house
+  // style — no AbortSignal.any) and arm the graceful scope for the upload's
+  // duration, so Ctrl-C during a long PUT takes the honest detach path
+  // instead of being unabortable.
   const shutdown = deps.shutdown ?? globalShutdown;
   const shutdownSignal = shutdown.signal;
   const onShutdownAbort = (): void => controller.abort(shutdownSignal.reason);
@@ -1181,7 +1182,7 @@ export async function runDocsUpload(
       headers: { 'content-type': contentType, 'content-length': String(stat.size) },
       body: Readable.toWeb(createReadStream(opts.file)) as unknown as RequestInit['body'],
       duplex: 'half',
-      // #342 review: assertSafePresignedUploadUrl vets the MINTED url, but a
+      // assertSafePresignedUploadUrl vets the MINTED url, but a
       // default `redirect: 'follow'` would let a 3xx from that host resend
       // the request to an unvetted Location (e.g. a 303 → 169.254.169.254) —
       // an SSRF-shaped hop the guard never sees. A real S3 presigned PUT never
@@ -1226,10 +1227,10 @@ export async function runDocsUpload(
     });
   } catch (cause) {
     if (cause instanceof ApiError) throw registerStepError(cause);
-    // DEV-384 review F4: a register timeout needs the same step-3 context —
-    // it is precisely the case where the caller can't tell whether the
-    // register landed. Class and exit 7 are preserved; only the text gains
-    // the upload-succeeded / safe-to-re-run explanation.
+    // A register timeout needs the same step-3 context — it is precisely the
+    // case where the caller can't tell whether the register landed. Class and
+    // exit 7 are preserved; only the text gains the upload-succeeded /
+    // safe-to-re-run explanation.
     if (cause instanceof RequestTimeoutError) {
       cause.message =
         `Document register timed out (step 3 of 3) — the S3 upload succeeded, and the ` +
@@ -1265,7 +1266,7 @@ function describeCause(cause: unknown): string {
 }
 
 /**
- * DEV-384 review F3 — defense-in-depth on the server-minted presigned URL.
+ * Defense-in-depth on the server-minted presigned URL.
  *
  * A REMOTE facade must mint a non-local `https:` URL; a localhost/private or
  * plain-http mint from a remote facade is exactly the anomaly to reject
@@ -1273,18 +1274,17 @@ function describeCause(cause: unknown): string {
  * otherwise send the user's file wherever that URL points, before any bytes
  * leave the machine. A facade that is ITSELF loopback (dev rig, localhost
  * e2e) is a deliberate operator configuration and is trusted to mint local
- * URLs — and ONLY loopback qualifies (#342 review): the gate is a positive,
- * fail-closed check, because gating on "anything `assertNotLocal` dislikes"
- * would silently disable the guard for an unparsable base URL or a
- * user-settable private-range endpoint (`--endpoint-url https://10.1.2.3`).
- * Literal checks only (same scope as `assertNotLocal`); no host
- * allow-listing by design.
+ * URLs — and ONLY loopback qualifies: the gate is a positive, fail-closed
+ * check, because gating on "anything `assertNotLocal` dislikes" would
+ * silently disable the guard for an unparsable base URL or a user-settable
+ * private-range endpoint (`--endpoint-url https://10.1.2.3`). Literal checks
+ * only (same scope as `assertNotLocal`); no host allow-listing by design.
  *
- * Known residual (#342 review): a loopback facade that is really a TUNNEL to a
- * remote backend (`ssh -L`, a localhost corporate proxy) is trusted here even
- * though the real conversation is remote and MITM-able upstream. This is
- * inherent to "loopback facade = trusted dev rig" and accepted — the CLI
- * cannot tell a dev rig from a tunnel by the base URL alone.
+ * Known residual: a loopback facade that is really a TUNNEL to a remote
+ * backend (`ssh -L`, a localhost corporate proxy) is trusted here even though
+ * the real conversation is remote and MITM-able upstream. This is inherent to
+ * "loopback facade = trusted dev rig" and accepted — the CLI cannot tell a
+ * dev rig from a tunnel by the base URL alone.
  */
 function assertSafePresignedUploadUrl(uploadUrl: string, facadeBaseUrl: string): void {
   if (isLoopbackFacade(facadeBaseUrl)) return;
@@ -1328,7 +1328,7 @@ function isLocalUrl(url: string): boolean {
 }
 
 /**
- * #342 review: the facade-trust gate for `assertSafePresignedUploadUrl`.
+ * The facade-trust gate for `assertSafePresignedUploadUrl`.
  * Positive and narrow — only an explicitly-loopback facade (`localhost`,
  * a `127.0.0.0/8` literal, or `[::1]`) is trusted to mint local upload URLs.
  * Anything else — including an unparsable base URL or a private-range
@@ -1436,7 +1436,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       // the contract-mandated exit code 5.
       await runList(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           pageSize: parseFlag(cmdOpts.pageSize, 'page-size'),
           startingToken: cmdOpts.startingToken,
           maxItems: parseFlag(cmdOpts.maxItems, 'max-items'),
@@ -1452,7 +1452,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .description('Get a project by id')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (projectId: string, _cmdOpts, command: Command) => {
-      await runGet({ ...resolveCommonOptions(command), projectId }, deps);
+      await runGet({ ...resolveCommonOptions(command, deps.env), projectId }, deps);
     });
 
   project
@@ -1501,7 +1501,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       }
       await runCreate(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           type,
           name: cmdOpts.name,
           targetUrl: cmdOpts.url,
@@ -1559,7 +1559,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .action(async (projectId: string, cmdOpts: UpdateFlagOpts, command: Command) => {
       await runUpdate(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           projectId,
           name: cmdOpts.name,
           targetUrl: cmdOpts.url,
@@ -1601,7 +1601,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .action(async (projectId: string, cmdOpts: DeleteFlagOpts, command: Command) => {
       await runDelete(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           projectId,
           confirm: cmdOpts.confirm === true,
           idempotencyKey: cmdOpts.idempotencyKey,
@@ -1627,7 +1627,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .action(async (projectId: string, cmdOpts: CredentialFlagOpts, command: Command) => {
       await runCredential(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           projectId,
           authType: cmdOpts.type,
           credential: cmdOpts.credential,
@@ -1675,7 +1675,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .action(async (projectId: string, cmdOpts: AutoAuthFlagOpts, command: Command) => {
       await runAutoAuth(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           projectId,
           disable: cmdOpts.disable,
           method: cmdOpts.method,
@@ -1709,7 +1709,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
   docs
     .command('upload <file>')
     .description(
-      'Upload an API spec or PRD as a project source (DEV-384). Three steps:\n' +
+      'Upload an API spec or PRD as a project source. Three steps:\n' +
         'mint a presigned S3 URL, stream the file bytes to it, register the\n' +
         'document — which starts processing + embedding. The local file is\n' +
         'only read; nothing is written back to disk.\n' +
@@ -1732,7 +1732,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .action(async (file: string, cmdOpts: DocsUploadFlagOpts, command: Command) => {
       await runDocsUpload(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           file,
           projectId: cmdOpts.project,
           role: cmdOpts.role,
@@ -1743,8 +1743,8 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       );
     });
   project.addCommand(docs);
-  // DEV-1305: `project env <verb>` — the per-project environment surface
-  // (credentials, URL, default). Own module; `deps` threaded so tests inject.
+  // `project env <verb>` — the per-project environment surface (credentials,
+  // URL, default). Own module; `deps` threaded so tests inject.
   project.addCommand(createProjectEnvCommand(deps));
 
   return project;
@@ -1849,13 +1849,13 @@ function parseFlag(raw: string | undefined, flagName: string): number | undefine
   return n;
 }
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   // P2-8: validate --output before allowing silent fallback to 'text'.
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
@@ -2054,7 +2054,7 @@ function renderDeleteText(r: CliDeleteProjectResponse): string {
 /**
  * `--project` resolution for `project docs upload` — mirrors test.ts's
  * resolveProjectId/requireProjectId so `TESTSPRITE_PROJECT_ID` works here the
- * same as on every other command (DEV-384 review F5). Flag wins over env.
+ * same as on every other command. Flag wins over env.
  */
 function requireDocsProjectId(projectId: string | undefined, deps: ProjectDeps): string {
   const explicit = projectId?.trim();

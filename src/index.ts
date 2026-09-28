@@ -19,6 +19,8 @@ import { createTunnelCommand } from './commands/tunnel.js';
 import { createTestCommand, type TunnelInterruptDetach } from './commands/test.js';
 import { createTestListCommand } from './commands/testlist.js';
 import { createUsageCommand } from './commands/usage.js';
+import { resolveProfileName } from './lib/config.js';
+import { classifyBillingRefusal } from './lib/billing-refusal.js';
 import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
 import {
   ApiError,
@@ -27,11 +29,16 @@ import {
   RequestTimeoutError,
   extractNodeErrorCode,
 } from './lib/errors.js';
-import { installBrokenPipeGuard, installSignalHandlers } from './lib/interrupt.js';
+import {
+  armInterruptExitBackstop,
+  installBrokenPipeGuard,
+  installSignalHandlers,
+} from './lib/interrupt.js';
 import { Output, isOutputMode } from './lib/output.js';
 import { maybeInstallProxyAgent } from './lib/proxy.js';
 import {
   renderAmbiguousOrgCandidates,
+  renderTunnelBindingLimitIds,
   renderCommanderError,
   rephraseUnknownOption,
 } from './lib/render-error.js';
@@ -46,16 +53,11 @@ import {
 } from './lib/telemetry.js';
 import { maybeNotifyUpdate } from './lib/update-check.js';
 import { VERSION } from './version.js';
-import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from './version-guard.js';
+import { rejectUnsupportedNodeVersion } from './version-guard.js';
 
 // Guard: exit early with a clear message on unsupported Node.js versions,
 // rather than failing later with a cryptic ESM/runtime error.
-if (shouldRejectNodeVersion(process.versions.node)) {
-  process.stderr.write(
-    `Error: testsprite requires Node.js ${SUPPORTED_NODE_RANGE} (found ${process.versions.node}).\nInstall a supported Node.js release from https://nodejs.org\n`,
-  );
-  process.exit(1);
-}
+rejectUnsupportedNodeVersion(process.versions.node);
 
 const program = new Command();
 
@@ -313,7 +315,7 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
       commandPath,
       output: isOutputMode(globals.output) ? globals.output : 'text',
       dryRun: globals.dryRun ?? false,
-      profile: globals.profile ?? 'default',
+      profile: resolveProfileName(globals.profile),
       cwd: process.cwd(),
       env: process.env,
       debug: globals.debug ?? false,
@@ -338,12 +340,12 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   }
 });
 
-// Clean process lifecycle (DEV-331 piece 1, errors.md §8.1): during a `--wait`
+// Clean process lifecycle (errors.md §8.1): during a `--wait`
 // poll the scope is armed — the first SIGINT/SIGTERM/SIGHUP aborts gracefully
 // and the wait path prints an honest partial (the run KEEPS executing and
 // billing server-side) + re-attach hint before exiting 128+signum; a second
-// signal hard-exits. Outside an armed scope: a clear one-line message +
-// immediate exit (instead of Node's silent abrupt kill). Plus an EPIPE guard
+// signal hard-exits. Outside an armed scope: a clear one-line message, then
+// drain an in-flight request or exit immediately when idle. Plus an EPIPE guard
 // so piping to a reader that closes early (`| head`) exits cleanly instead of
 // dumping a raw `write EPIPE` stack.
 installSignalHandlers();
@@ -384,7 +386,7 @@ try {
   // user's error. The classification mirrors the exit-code mapping the
   // branches apply.
   //
-  // DEV-673: SET `process.exitCode` and let the event loop drain instead of
+  // SET `process.exitCode` and let the event loop drain instead of
   // forcing `process.exit()`. A forced exit tears the process down while the
   // just-completed HTTPS request's TLS socket is still mid-close; on Windows
   // libuv asserts on the half-closed handle (src/win/async.c) and the process
@@ -417,6 +419,7 @@ try {
   const mode = isOutputMode(rawMode) ? rawMode : 'text';
   const output = new Output(mode);
   if (err instanceof ApiError) {
+    const billingRefusal = classifyBillingRefusal(err);
     const message =
       err.code === 'UNSUPPORTED' &&
       err.getDetail('reason') === 'tunnel-unsupported-for-backend-test'
@@ -430,12 +433,16 @@ try {
           nextAction: err.nextAction,
           requestId: err.requestId,
           details: err.details,
+          ...(billingRefusal ? { links: billingRefusal.links } : {}),
         },
       };
       process.stderr.write(`${JSON.stringify(envelope, null, 2)}\n`);
     } else {
       process.stderr.write(`Error: ${message}\n`);
       if (err.nextAction) process.stderr.write(`${err.nextAction}\n`);
+      if (billingRefusal) {
+        for (const line of billingRefusal.lines) process.stderr.write(`${line}\n`);
+      }
       if (err.requestId && err.requestId !== 'local')
         process.stderr.write(`requestId: ${err.requestId}\n`);
       // C1: surface requiredScopes / grantedScopes on AUTH_FORBIDDEN
@@ -467,13 +474,17 @@ try {
           process.stderr.write(`${line}\n`);
         }
       }
+      if (err.code === 'RATE_LIMITED' && err.getDetail('reason') === 'tunnel_binding_limit') {
+        for (const line of renderTunnelBindingLimitIds(err.getDetail('clientIds'))) {
+          process.stderr.write(`${line}\n`);
+        }
+      }
     }
     await flushThenSetExitCode(err.exitCode);
   } else if (err instanceof InterruptError) {
-    // Graceful detach (DEV-331 piece 1, errors.md §8.1): the wait-path catch
-    // block already printed the honest partial + re-attach hint. Exit with
-    // the conventional 128+signum code; `INTERRUPTED` is deliberately outside
-    // the error catalog. Note: Ctrl-C does NOT cancel the server-side run.
+    // A run wait may already have printed a partial result and re-attach hint.
+    // A disarmed request has no run ID, so its JSON hint describes checking
+    // current state before retrying. Both use the conventional 128+signum code.
     if (mode === 'json') {
       const tunnelDetach = (err as InterruptError & { tunnelDetach?: TunnelInterruptDetach })
         .tunnelDetach;
@@ -483,9 +494,12 @@ try {
           message: err.message,
           nextAction:
             tunnelDetach?.nextAction ??
-            'The server-side run (if any) keeps executing and billing. ' +
-              'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
-              '(runId is in the partial JSON on stdout).',
+            (err.runWaitContext
+              ? 'The server-side run (if any) keeps executing and billing. ' +
+                'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
+                '(runId is in the partial JSON on stdout).'
+              : 'The request was interrupted. Check the current state before retrying; ' +
+                'a multi-item command may have processed some items.'),
           requestId: 'local',
           details: {
             signal: err.signal,
@@ -500,6 +514,7 @@ try {
       process.stderr.write(`Error: ${err.message}\n`);
     }
     await flushThenSetExitCode(err.exitCode);
+    armInterruptExitBackstop(err.exitCode);
   } else if (err instanceof RequestTimeoutError) {
     // Structured rendering for per-request timeouts: JSON mode emits a
     // machine-readable envelope; text mode emits the message with a hint.
@@ -533,7 +548,7 @@ try {
     //                               help`, `help test`, etc.)
     // Both are user-initiated "show me help" requests and must exit 0 per the
     // AWS-CLI convention. Failing to map 'commander.help' caused these paths
-    // to fall through to the generic `process.exit(5)` branch (dogfood P1-4).
+    // to fall through to the generic `process.exit(5)` branch.
     if (
       err.code === 'commander.helpDisplayed' ||
       err.code === 'commander.help' ||

@@ -27,7 +27,7 @@ export interface TargetSpec {
    * truncated beyond) and `copilot` (no cap, but `applyTo: '**'` injects it into
    * every request, so context cost is the constraint).
    *
-   * Read it via {@link ownFileBodyFor}, never by testing target names (DEV-672).
+   * Read it via {@link ownFileBodyFor}, never by testing target names.
    */
   compactBody?: boolean;
   /**
@@ -398,8 +398,8 @@ export function compactBodyFor(skill: string, read: ReadFn = defaultRead): strin
 /**
  * The canonical own-file body for a (target, skill) pair, and therefore the body
  * the install marker's hash covers. Every producer AND consumer of an own-file
- * body must resolve through here — install and status keeping separate copies of
- * this rule is what caused DEV-672.
+ * body must resolve through here — keeping separate copies of this rule is
+ * what lets install and status disagree on the same file.
  */
 export function ownFileBodyFor(
   target: AgentTarget,

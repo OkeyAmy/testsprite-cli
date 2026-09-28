@@ -1,4 +1,5 @@
 import { appendFileSync, writeFileSync } from 'node:fs';
+import { describeConflict, type RunConflict } from './conflict-reason.js';
 
 /**
  * CI-native output layer for the run path (issue #99, reshaped from
@@ -62,13 +63,21 @@ const NON_DISPATCHED_STATUSES: ReadonlySet<string> = new Set([
   'no_tests',
 ]);
 
+export function isNonDispatchedStatus(status: string): boolean {
+  return NON_DISPATCHED_STATUSES.has(status);
+}
+
 /**
  * Reduce a non-dispatched bucket (`deferred` / `conflicts` / `notFound`) into
  * CI rows. Items are either bare testId strings (`notFound`) or
  * `{ testId, currentRunId? }` objects; both shapes are handled. `note` becomes
  * the row's error text so the annotation explains why the item did not run.
  */
-function bucketRows(bucket: unknown, status: string, note: string): CiRunRow[] {
+function bucketRows(
+  bucket: unknown,
+  status: string,
+  note: string | ((item: unknown) => string),
+): CiRunRow[] {
   if (!Array.isArray(bucket)) return [];
   return bucket.map(item => {
     const rec =
@@ -80,7 +89,7 @@ function bucketRows(bucket: unknown, status: string, note: string): CiRunRow[] {
       testId,
       status,
       ...(currentRunId ? { runId: currentRunId } : {}),
-      error: note,
+      error: typeof note === 'string' ? note : note(item),
     };
   });
 }
@@ -143,7 +152,12 @@ export function summarizeAcceptedPayload(
   const rows: CiRunRow[] = [
     ...acceptedRows,
     ...bucketRows(payload.deferred, 'deferred', 'rate-deferred (not dispatched)'),
-    ...bucketRows(payload.conflicts, 'conflict', 'already in flight (not dispatched)'),
+    ...bucketRows(payload.conflicts, 'conflict', item => {
+      const conflict = item as Partial<RunConflict> | null;
+      return conflict && typeof conflict.testId === 'string' && conflict.reason
+        ? `${describeConflict(conflict as RunConflict)} (not dispatched)`
+        : 'already in flight (not dispatched)';
+    }),
     // Default note is `test rerun`'s cause (a not-found id has no replayable
     // run). `testlist run` passes its own — a not-found `--case` id is one that
     // is not a member of the list — so the annotation/artifact don't state the
@@ -156,7 +170,7 @@ export function summarizeAcceptedPayload(
   ];
   const passed = rows.filter(row => row.status === 'passed').length;
   const timedOut = rows.filter(row => row.status === 'timeout').length;
-  const skipped = rows.filter(row => NON_DISPATCHED_STATUSES.has(row.status)).length;
+  const skipped = rows.filter(row => isNonDispatchedStatus(row.status)).length;
   const failed = rows.length - passed - timedOut - skipped;
   return { total: rows.length, passed, failed, skipped, timedOut, runs: rows };
 }
@@ -188,7 +202,7 @@ export function summarizeSingleRun(run: {
   };
   const passed = row.status === 'passed' ? 1 : 0;
   const timedOut = row.status === 'timeout' ? 1 : 0;
-  const skipped = NON_DISPATCHED_STATUSES.has(row.status) ? 1 : 0;
+  const skipped = isNonDispatchedStatus(row.status) ? 1 : 0;
   const failed = 1 - passed - timedOut - skipped;
   return { total: 1, passed, failed, skipped, timedOut, runs: [row] };
 }

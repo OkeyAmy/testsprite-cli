@@ -19,13 +19,17 @@ import {
   type FetchImpl,
   type HttpClient,
 } from '../lib/http.js';
+import { resolveProfileName } from '../lib/config.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { pollRunUntilTerminal, TimeoutError } from '../lib/poll.js';
 import { emitCiArtifacts, summarizeAcceptedPayload } from '../lib/gh-output.js';
 import {
+  billingConflictLink,
   describeConflict,
   insufficientCreditsConflictError,
   isAllCreditsRefusal,
+  isPausedRefusal,
+  pausedConflictError,
   summarizeConflicts,
 } from '../lib/conflict-reason.js';
 import { recordBatchOutcome } from '../lib/telemetry.js';
@@ -34,13 +38,14 @@ import { createTicker } from '../lib/ticker.js';
 import {
   buildJUnitReport,
   parseJUnitReportFormat,
+  skippedJUnitResultsFromSummary,
   writeJUnitReportFile,
   type JUnitReportFormat,
   type JUnitTestResult,
 } from '../lib/junit-report.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
-import { resolveWaitFailure } from '../lib/wait-exit.js';
+import { resolveWaitFailure, waitMemberError } from '../lib/wait-exit.js';
 import type {
   CliDeleteTestListResponse,
   CliProjectEnvironment,
@@ -65,10 +70,10 @@ type CommonOptions = FactoryCommonOptions;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const g = command.optsWithGlobals() as Partial<CommonOptions> & { requestTimeout?: string };
   return {
-    profile: g.profile ?? 'default',
+    profile: resolveProfileName(g.profile, env),
     output: resolveOutputMode(g.output),
     endpointUrl: g.endpointUrl,
     debug: g.debug ?? false,
@@ -533,6 +538,10 @@ export async function runTestlistRun(
       `warning: ${resp.notFound.length} --case id(s) not in this list, skipped: ${resp.notFound.join(' ')}`,
     );
   }
+  if (resp.accepted.length > 0) {
+    const link = billingConflictLink(resp.conflicts, client.resolvedBaseUrl);
+    if (link) stderrFn(`[advisory] Billing refusal for some tests.${link}`);
+  }
 
   // All-conflict: nothing new dispatched because every targeted case is already
   // in flight → exit 6, for BOTH --wait and non-wait (a --wait over zero accepted
@@ -553,20 +562,32 @@ export async function runTestlistRun(
     // into the summary as non-passed rows. The non-wait path never emits CI
     // artifacts, matching the main tail below.
     if (opts.wait) {
-      emitCiArtifacts(
-        summarizeAcceptedPayload(
-          JSON.stringify({
-            accepted: [],
-            conflicts: resp.conflicts,
-            deferred: resp.deferred,
-            // Include notFound too: a mixed `--case` selection can be
-            // all-conflict on its matched ids AND carry not-in-list ids, and the
-            // CI summary must report the whole requested set (same reason the
-            // main --wait envelope threads it). Undefined ⇒ JSON.stringify drops it.
-            notFound: resp.notFound,
+      const summary = summarizeAcceptedPayload(
+        JSON.stringify({
+          accepted: [],
+          conflicts: resp.conflicts,
+          deferred: resp.deferred,
+          // Include notFound too: a mixed `--case` selection can be
+          // all-conflict on its matched ids AND carry not-in-list ids, and the
+          // CI summary must report the whole requested set (same reason the
+          // main --wait envelope threads it). Undefined ⇒ JSON.stringify drops it.
+          notFound: resp.notFound,
+        }),
+        { notFoundNote: 'not a member of this list (not dispatched)' },
+      );
+      if (opts.report === 'junit' && opts.reportFile !== undefined) {
+        const suiteName = opts.reportSuiteName ?? `testsprite:testlist:${opts.listId}`;
+        await writeJUnitReportFile(
+          opts.reportFile,
+          buildJUnitReport({
+            suiteName,
+            classname: `testlist:${opts.listId}`,
+            results: skippedJUnitResultsFromSummary(summary),
           }),
-          { notFoundNote: 'not a member of this list (not dispatched)' },
-        ),
+        );
+      }
+      emitCiArtifacts(
+        summary,
         opts,
         {
           env: deps.env ?? process.env,
@@ -582,17 +603,25 @@ export async function runTestlistRun(
     if (isAllCreditsRefusal(resp)) {
       throw insufficientCreditsConflictError(resp.conflicts, client.resolvedBaseUrl);
     }
+    if (isPausedRefusal(resp)) {
+      throw pausedConflictError(resp.conflicts, client.resolvedBaseUrl);
+    }
     const pollIds = resp.conflicts
       .map(c => c.currentRunId)
       .filter((id): id is string => Boolean(id));
     // Name the causes instead of blanket "already in flight" — a list pinned to
     // a local env or a view-only project is not something to poll. The poll hint
-    // is emitted only for the cases that actually have an in-flight run.
+    // is emitted only for the cases that actually have an in-flight run. A
+    // paused (`billing_hold`) / insufficient_credits conflict riding along a NON-uniform
+    // mix (the uniform cases already threw above) still needs its upgrade
+    // link — `accepted.length` is 0 in this whole branch, so the advisory
+    // printed earlier (guarded on `accepted.length > 0`) never showed it.
     throw new CLIError(
       `Nothing dispatched — ${resp.conflicts.length} conflict(s): ${summarizeConflicts(resp.conflicts)}` +
         (pollIds.length > 0
           ? `. Poll in-flight runs: testsprite test wait ${pollIds.join(' ')}`
-          : ''),
+          : '') +
+        billingConflictLink(resp.conflicts, client.resolvedBaseUrl),
       6,
     );
   }
@@ -703,7 +732,7 @@ export async function runTestlistRun(
           testId: entry.testId,
           runId: entry.runId,
           status: 'error',
-          error: { code: err.code, message: err.message, exitCode: err.exitCode },
+          error: waitMemberError(err),
         };
       }
       throw err;
@@ -768,7 +797,14 @@ export async function runTestlistRun(
     // Multi-project list: name the suite/classname by the LIST, not one project
     // (`resolveBatchReportProjectId`'s single-project assumption doesn't hold).
     const suiteName = opts.reportSuiteName ?? `testsprite:testlist:${opts.listId}`;
-    const xml = buildJUnitReport({ suiteName, classname: `testlist:${opts.listId}`, results });
+    const summary = summarizeAcceptedPayload(JSON.stringify(jsonPayload), {
+      notFoundNote: 'not a member of this list (not dispatched)',
+    });
+    const xml = buildJUnitReport({
+      suiteName,
+      classname: `testlist:${opts.listId}`,
+      results: [...results, ...skippedJUnitResultsFromSummary(summary)],
+    });
     await writeJUnitReportFile(opts.reportFile, xml);
   }
 
@@ -900,7 +936,7 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
     .action(async (cmdOpts: { columns?: string; header?: boolean }, command: Command) => {
       await runTestlistList(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           columns: cmdOpts.columns,
           noHeader: cmdOpts.header === false,
         },
@@ -913,7 +949,7 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
     .description('Get a test list with its cases')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (listId: string, _cmdOpts, command: Command) => {
-      await runTestlistGet({ ...resolveCommonOptions(command), listId }, deps);
+      await runTestlistGet({ ...resolveCommonOptions(command, deps.env), listId }, deps);
     });
 
   testlist
@@ -935,7 +971,7 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
       ) => {
         await runTestlistCreate(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             name: cmdOpts.name,
             projectEnv: cmdOpts.projectEnv,
             idempotencyKey: cmdOpts.idempotencyKey,
@@ -971,7 +1007,7 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
       ) => {
         await runTestlistUpdate(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             listId,
             name: cmdOpts.name,
             projectEnv: cmdOpts.projectEnv,
@@ -997,7 +1033,7 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
       ) => {
         await runTestlistDelete(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             listId,
             confirm: cmdOpts.confirm,
             idempotencyKey: cmdOpts.idempotencyKey,
@@ -1021,7 +1057,7 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
       ) => {
         await runTestlistAdd(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             listId,
             testIds,
             idempotencyKey: cmdOpts.idempotencyKey,
@@ -1045,7 +1081,7 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
       ) => {
         await runTestlistRemove(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             listId,
             testIds,
             idempotencyKey: cmdOpts.idempotencyKey,
@@ -1109,7 +1145,7 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
         const wait = cmdOpts.wait === true;
         await runTestlistRun(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             listId,
             cases: cmdOpts.case,
             wait,

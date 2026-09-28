@@ -192,6 +192,9 @@ gate — a maintainer always makes the final call.
   `test/…`, `chore/…`.
 - Commit messages follow [Conventional Commits](https://www.conventionalcommits.org)
   — e.g. `feat(cli): …`, `fix(http): …`.
+- Code, tests, and workflow/script files should explain themselves in plain
+  language rather than reference an internal tracker ticket number; put that
+  in the PR description or commit message instead (a CI check enforces this).
 - Keep PRs focused — one logical change per PR is easier to review and merge.
 - This repo is the open-source distribution of the TestSprite CLI; the canonical
   development happens internally and is mirrored here. After your PR is merged,

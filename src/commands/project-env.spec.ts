@@ -1,5 +1,5 @@
 /**
- * Unit tests for `project env <verb>` — DEV-1305 (Phase 1 of DEV-793).
+ * Unit tests for `project env <verb>`.
  *
  * All HTTP is mocked via `makeFetch` / `makeCreds`, same harness as
  * `project.test.ts`. Every write verb is exercised for its wire shape
@@ -78,7 +78,7 @@ function makeCreds(apiKey = 'sk-user-test', apiUrl = 'http://localhost:13504') {
 
 const PROJECT_ID = '22c810b0-f34c-42c0-b372-af6f4e1c4fc7';
 const SECRET = 'hunter2-DO-NOT-PRINT';
-/** DEV-1305: an app that only runs on this machine is a real environment target. */
+/** An app that only runs on this machine is a real environment target. */
 const LOCAL_URL = 'http://127.0.0.1:5173';
 
 function env(overrides: Partial<CliProjectEnvironment> = {}): CliProjectEnvironment {

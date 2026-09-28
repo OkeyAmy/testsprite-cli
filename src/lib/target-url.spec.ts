@@ -731,8 +731,8 @@ describe('assertNotLocal — local project creation guidance', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Stored-URL refusals (DEV-1305): the unspecified addresses are named for what
-// they are, and the caller's flag/help command ride into the envelope.
+// Stored-URL refusals: the unspecified addresses are named for what they are,
+// and the caller's flag/help command ride into the envelope.
 // ---------------------------------------------------------------------------
 
 describe('assertNotLocal — stored-URL wording', () => {

@@ -1,6 +1,5 @@
 /**
- * `testsprite project env <verb>` — the per-project environment surface
- * (DEV-1305, Phase 1 of DEV-793).
+ * `testsprite project env <verb>` — the per-project environment surface.
  *
  * An environment is a named bundle of "how to reach and log in to the app": a
  * URL and a login method. `test run --env <name>`
@@ -35,6 +34,7 @@ import {
   parseRequestTimeoutFlag,
   type CommonOptions,
 } from '../lib/client-factory.js';
+import { resolveProfileName } from '../lib/config.js';
 import { ApiError } from '../lib/errors.js';
 import type { HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
@@ -102,12 +102,12 @@ export interface CliProjectEnvDeleteResponse {
 // not import `project.ts` at runtime — that file imports this one).
 // ---------------------------------------------------------------------------
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
@@ -616,7 +616,7 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
     .description("List a project's environments (name, default, URL, auth)." + EXIT_CODE_NOTE)
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (projectId: string, _cmdOpts: unknown, command: Command) => {
-      await runEnvList({ ...resolveCommonOptions(command), projectId }, deps);
+      await runEnvList({ ...resolveCommonOptions(command, deps.env), projectId }, deps);
     });
 
   env
@@ -647,7 +647,7 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
     .action(async (projectId: string, cmdOpts: EnvCreateFlagOpts, command: Command) => {
       await runEnvCreate(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           projectId,
           name: cmdOpts.name,
           url: cmdOpts.url,
@@ -693,7 +693,7 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
       async (projectId: string, name: string, cmdOpts: EnvUpdateFlagOpts, command: Command) => {
         await runEnvUpdate(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             projectId,
             name,
             url: cmdOpts.url,
@@ -725,7 +725,7 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
       async (projectId: string, name: string, cmdOpts: EnvDeleteFlagOpts, command: Command) => {
         await runEnvDelete(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             projectId,
             name,
             confirm: cmdOpts.confirm === true,
@@ -754,7 +754,7 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
       ) => {
         await runEnvSetDefault(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             projectId,
             name,
             idempotencyKey: cmdOpts.idempotencyKey,

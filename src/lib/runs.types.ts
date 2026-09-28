@@ -5,7 +5,7 @@
 
  */
 
-import type { RunConflict } from './conflict-reason.js';
+import type { ConflictReason, RunConflict } from './conflict-reason.js';
 
 /** Literal body sent to `POST /api/cli/v1/tests/{testId}/runs`. */
 export interface TriggerRunBody {
@@ -14,7 +14,7 @@ export interface TriggerRunBody {
   /** Optional override for the project's configured target URL. */
   targetUrl?: string;
   /**
-   * DEV-747: id of a tunnel client minted through `POST /api/cli/v1/tunnel`.
+   * Id of a tunnel client minted through `POST /api/cli/v1/tunnel`.
    *
    * An ID, never a proxy string — the caller does not choose the proxy host.
    * The server loads the binding, checks it belongs to the calling principal
@@ -25,11 +25,27 @@ export interface TriggerRunBody {
    */
   tunnelClientId?: string;
   /**
-   * DEV-1305: the NAME of the project environment whose credentials, auto-auth
-   * and OTP settings this run should use (`unique(project_id, name)` server
-   * side). Absent → the project's default environment, exactly as before.
-   * Composes with `targetUrl`/`tunnelClientId`: those pick WHERE the browser
-   * goes, this picks WHOSE credentials it logs in with.
+   * May the agent re-author this test when its stored code no longer
+   * executes?
+   *
+   * OMITTED on purpose whenever auto-heal is on. The field is tri-state on the
+   * wire and the CLI only ever sends one of its three states: `false`, for
+   * `--no-auto-heal`. Absent means "heal, but replay a user-authored body
+   * rather than rewriting it" — the server-side default — and sending an
+   * explicit `true` would mean something DIFFERENT and worse here: an
+   * unconditional heal that re-authors code the user wrote. So the default is
+   * expressed by saying nothing, which also means an older backend (the field
+   * is stripped by `whitelist: true`, never 400'd) behaves exactly as it does
+   * today for the default case.
+   */
+  autoHeal?: false;
+
+  /**
+   * The NAME of the project environment whose credentials, auto-auth and OTP
+   * settings this run should use (`unique(project_id, name)` server side).
+   * Absent → the project's default environment, exactly as before. Composes
+   * with `targetUrl`/`tunnelClientId`: those pick WHERE the browser goes,
+   * this picks WHOSE credentials it logs in with.
    */
   environment?: string;
 }
@@ -151,10 +167,17 @@ export interface BatchRerunDeferred {
   reason: string;
 }
 
-/** One conflicted (already in-flight) testId in the batch rerun response. */
+/**
+ * One testId in the batch rerun response that did not dispatch.
+ *
+ * `currentRunId` is present only when the refusal points at a run already in
+ * flight; otherwise `reason` says why it did not start.
+ */
 export interface BatchRerunConflict {
   testId: string;
-  currentRunId: string;
+  currentRunId?: string;
+  reason?: ConflictReason;
+  message?: string;
 }
 
 /** Per-project closure summary in the batch rerun response. */
@@ -201,6 +224,16 @@ export interface TriggerRunResponse {
   runId: string;
   status: 'queued';
   enqueuedAt: string;
+  /**
+   * The EFFECTIVE heal decision the server made for this run.
+   *
+   * OPTIONAL on purpose, and the absence is the load-bearing case: the backend
+   * runs `whitelist: true`, so a CLI sending `autoHeal` to a server that
+   * predates the field has it silently STRIPPED and the run heals anyway. An
+   * absent echo is how the CLI learns it is talking to such a server and that
+   * `--no-auto-heal` did nothing — without it the opt-out is unfalsifiable.
+   */
+  autoHeal?: boolean;
   /** codeVersion resolved at trigger time from the test row. */
   codeVersion: string;
   /** Resolved target URL (project default when --target-url absent). */
@@ -343,7 +376,7 @@ export interface RunResponse {
 }
 
 // ---------------------------------------------------------------------------
-// DEV-331 piece 3 — cancel wire types
+// Cancel wire types
 // ---------------------------------------------------------------------------
 
 /** Credit outcome returned when cancellation applies V3 frontend billing rules. */
@@ -462,6 +495,11 @@ export interface RunHistoryMeta {
   note?: string;
   /** Portal URL where older run history can be viewed. */
   portalUrl?: string;
+  /** Plan-limited history details; absent on older backends and V2. */
+  tier?: string;
+  retentionDays?: number | null;
+  hiddenCount?: number;
+  billingUrl?: string;
 }
 
 /**
@@ -484,7 +522,7 @@ export interface ListRunsQuery {
   source?: RunSource;
   /** ISO timestamp (after client-side duration parsing). */
   since?: string;
-  /** DEV-1306: only runs whose credentials came from this environment (by name). */
+  /** Only runs whose credentials came from this environment (by name). */
   environment?: string;
 }
 
@@ -501,8 +539,12 @@ export interface BatchRunFreshRequest {
   projectId: string;
   testIds?: string[];
   source: 'cli';
+  /** See `TriggerRunBody.autoHeal`, including why `true` is never sent. */
+  autoHeal?: false;
   /** See `TriggerRunBody.environment` — applied to every test in the batch. */
   environment?: string;
+  /** Per-run URL override for the batch; echoed when the backend honors it. */
+  targetUrl?: string;
 }
 
 /** One accepted run in the batch fresh-run response. */
@@ -536,6 +578,8 @@ export interface BatchRunFreshAccepted {
  */
 export interface BatchRunFreshResponse {
   accepted: BatchRunFreshAccepted[];
+  /** See `TriggerRunResponse.autoHeal`; absence means the same thing. */
+  autoHeal?: boolean;
   /**
    * A run-slot conflict. `currentRunId`, when present, is the id of the run
    * ALREADY in flight for this test — under `--wait` the CLI polls it to a
@@ -556,4 +600,10 @@ export interface BatchRunFreshResponse {
    * nothing rather than a dead link.
    */
   dashboardUrl?: string | null;
+  /**
+   * Exact echo of the request's `targetUrl` when the backend read the override.
+   * A missing or different echo makes the CLI refuse the batch rather than
+   * report a verdict for an unconfirmed target.
+   */
+  targetUrl?: string;
 }

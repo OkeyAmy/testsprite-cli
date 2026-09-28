@@ -642,7 +642,7 @@ describe('runResultHistory — JSON mode', () => {
     expect(parsed.nextCursor).toBe('cursor_xyz');
   });
 
-  it('JSON mode does not include meta in output envelope', async () => {
+  it('JSON mode preserves the backend meta in the output envelope', async () => {
     const { credentialsPath } = makeCreds();
     const lines: string[] = [];
     const resp = makeHistoryResp([makeHistoryItem()], null, { testKind: 'frontend' });
@@ -666,8 +666,7 @@ describe('runResultHistory — JSON mode', () => {
     );
 
     const parsed = JSON.parse(lines.join('')) as Record<string, unknown>;
-    // The JSON output shape is { runs, nextCursor } — not the full wire envelope.
-    expect('meta' in parsed).toBe(false);
+    expect(parsed.meta).toEqual(resp.meta);
   });
 });
 
@@ -1751,10 +1750,10 @@ describe('empty latest steps history hint', () => {
 });
 
 // ---------------------------------------------------------------------------
-// DEV-1306 — environment on the history surface
+// Environment on the history surface
 // ---------------------------------------------------------------------------
 
-describe('runResultHistory — environment (DEV-1306)', () => {
+describe('runResultHistory — environment', () => {
   const common = { profile: 'default', dryRun: false, debug: false, verbose: false } as const;
 
   it('renders an ENV column: the environment name, or — when the row names none', async () => {

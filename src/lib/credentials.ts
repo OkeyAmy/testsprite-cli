@@ -122,6 +122,11 @@ const FIELD_TO_FILE_KEY: Record<keyof ProfileEntry, string> = {
 
 const CREDENTIALS_LOCK_RETRY_MS = 25;
 const CREDENTIALS_LOCK_WAIT_MS = 5_000;
+// On Windows a lock file that another process is closing or deleting (or that
+// a scanner briefly holds) reports EPERM/EBUSY/EACCES instead of EEXIST. That
+// clears within milliseconds; one that persists this long is a real permission
+// problem and is surfaced as such.
+const CREDENTIALS_LOCK_TRANSIENT_WAIT_MS = 1_000;
 const CREDENTIALS_LOCK_STALE_MS = 30_000;
 
 export function parseCredentials(content: string): CredentialsFile {
@@ -343,6 +348,7 @@ function acquireCredentialsLock(path: string): CredentialsLock {
     token,
   };
 
+  let transientSince: number | undefined;
   while (true) {
     try {
       writeFileSync(lockPath, `${JSON.stringify(lockInfo)}\n`, {
@@ -355,11 +361,29 @@ function acquireCredentialsLock(path: string): CredentialsLock {
         release: () => releaseCredentialsLock(lockPath, token),
       };
     } catch (error) {
-      if (!isErrnoException(error) || error.code !== 'EEXIST') {
+      let transient: unknown = undefined;
+      if (isErrnoException(error) && error.code === 'EEXIST') {
+        transient = reclaimStaleCredentialsLock(lockPath);
+      } else if (isWindowsLockContention(error)) {
+        transient = error;
+      } else {
         rethrowCredentialsWriteError(error);
       }
 
-      reclaimStaleCredentialsLock(lockPath);
+      if (transient === undefined) {
+        transientSince = undefined;
+      } else {
+        transientSince ??= Date.now();
+        if (
+          Date.now() - transientSince >= CREDENTIALS_LOCK_TRANSIENT_WAIT_MS ||
+          Date.now() >= deadline
+        ) {
+          // Persistent, so not contention: fail exactly as the non-Windows
+          // path does for the same error.
+          if (transient === error) rethrowCredentialsWriteError(error);
+          throw transient;
+        }
+      }
       if (Date.now() >= deadline) {
         throw localValidationError(
           'credentialsLock',
@@ -401,7 +425,11 @@ function acquireCredentialsLock(path: string): CredentialsLock {
  * succeeding on the next `wx` attempt, so there is no need for this function
  * to draw that conclusion itself.
  */
-function reclaimStaleCredentialsLock(lockPath: string): void {
+/**
+ * Returns a Windows lock-contention error from the removal attempt so the
+ * caller can retry it within the transient budget; any other failure throws.
+ */
+function reclaimStaleCredentialsLock(lockPath: string): unknown {
   let lockInfo: CredentialsLockInfo | undefined;
   try {
     lockInfo = JSON.parse(readFileSync(lockPath, 'utf-8')) as CredentialsLockInfo;
@@ -431,10 +459,11 @@ function reclaimStaleCredentialsLock(lockPath: string): void {
   try {
     unlinkSync(lockPath);
   } catch (error) {
-    if (!isErrnoException(error) || error.code !== 'ENOENT') {
-      throw error;
-    }
+    if (isErrnoException(error) && error.code === 'ENOENT') return undefined;
+    if (isWindowsLockContention(error)) return error;
+    throw error;
   }
+  return undefined;
 }
 
 function assertCredentialsLockHeld(lockPath: string, token: string): void {
@@ -449,15 +478,26 @@ function assertCredentialsLockHeld(lockPath: string, token: string): void {
 }
 
 function releaseCredentialsLock(lockPath: string, token: string): void {
-  const lockInfo = readCredentialsLockInfo(lockPath);
-  if (lockInfo?.token !== token) return;
-  try {
-    unlinkSync(lockPath);
-  } catch (error) {
-    if (!isErrnoException(error) || error.code !== 'ENOENT') {
-      throw error;
+  const deadline = Date.now() + CREDENTIALS_LOCK_TRANSIENT_WAIT_MS;
+  while (readCredentialsLockInfo(lockPath)?.token === token) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `lockPath` is `${path}.lock`, derived from the internal credentials-file path; same risk profile as the other lock fs calls in this file.
+      unlinkSync(lockPath);
+      return;
+    } catch (error) {
+      if (isErrnoException(error) && error.code === 'ENOENT') return;
+      if (!isWindowsLockContention(error) || Date.now() >= deadline) throw error;
+      sleepSync(CREDENTIALS_LOCK_RETRY_MS);
     }
   }
+}
+
+function isWindowsLockContention(error: unknown): boolean {
+  return (
+    process.platform === 'win32' &&
+    isErrnoException(error) &&
+    (error.code === 'EPERM' || error.code === 'EBUSY' || error.code === 'EACCES')
+  );
 }
 
 function readCredentialsLockInfo(lockPath: string): CredentialsLockInfo | undefined {

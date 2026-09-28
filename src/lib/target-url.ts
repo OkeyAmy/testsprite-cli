@@ -236,12 +236,12 @@ export function disallowedIpReason(host: string): DisallowedIpClassification | u
 
 function disallowedIpv4Reason(address: string): DisallowedIpClassification | undefined {
   // Unspecified — binds every interface, including loopback. Named precisely
-  // rather than lumped in as "localhost" (DEV-1305): since a loopback URL is
-  // now a legitimate STORED target, calling `0.0.0.0` a localhost target
-  // produced a self-contradicting refusal — "localhost targets are not
-  // allowed" above a hint saying to use `localhost`. It is also simply not
-  // loopback: the server refuses it as a stored URL, so the accurate remedy is
-  // the loopback address the app is also reachable on.
+  // rather than lumped in as "localhost": since a loopback URL is now a
+  // legitimate STORED target, calling `0.0.0.0` a localhost target produced a
+  // self-contradicting refusal — "localhost targets are not allowed" above a
+  // hint saying to use `localhost`. It is also simply not loopback: the
+  // server refuses it as a stored URL, so the accurate remedy is the loopback
+  // address the app is also reachable on.
   if (address === '0.0.0.0') {
     return { reason: UNSPECIFIED_ADDRESS_REASON, hintKind: 'loopback' };
   }

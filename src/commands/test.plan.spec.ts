@@ -1,5 +1,5 @@
 /**
- * Unit tests for `test plan generate` / `test plan accept` — DEV-384 V3-B.
+ * Unit tests for `test plan generate` / `test plan accept`.
  *
  * All HTTP is mocked via `makeFetch` / `makeCreds` (same harness as
  * test.run.spec.ts); the ladder's sleep is injected as an instant no-op.
@@ -340,7 +340,7 @@ describe('runPlanGenerate — happy path', () => {
     expect(text).not.toContain('balance');
   });
 
-  it('DEV-1008: skippedCategories on the proposals trigger reaches text AND json output', async () => {
+  it('skippedCategories on the proposals trigger reaches text AND json output', async () => {
     const backend = makePlanBackend({
       triggers: [{ body: { ...accepted('proposals', []), skippedCategories: 2 } }],
       reads: [{ body: stagedPlans([], { charged: [], balance: 150 }) }, { body: stagedPlans() }],
@@ -363,7 +363,7 @@ describe('runPlanGenerate — happy path', () => {
     expect(result.skippedCategories).toBe(2);
   });
 
-  it('DEV-1008: the note still prints when zero proposals were staged, worded for nothing staged', () => {
+  it('the note still prints when zero proposals were staged, worded for nothing staged', () => {
     // Renderer-level: the ladder never settles on idle+empty after the
     // proposals rung (it polls to staged/failed/timeout), so this branch is
     // pinned directly. The skip count matters most here — it points at the
@@ -376,7 +376,7 @@ describe('runPlanGenerate — happy path', () => {
     expect(text).toContain(`testsprite test plan generate --project ${PROJECT_ID}`);
   });
 
-  it('DEV-1008: no skippedCategories key and no note when nothing was skipped', async () => {
+  it('no skippedCategories key and no note when nothing was skipped', async () => {
     const backend = makePlanBackend({
       triggers: [{ body: accepted('proposals', []) }],
       reads: [{ body: stagedPlans([], { charged: [], balance: 150 }) }, { body: stagedPlans() }],
@@ -390,8 +390,8 @@ describe('runPlanGenerate — happy path', () => {
     expect(capture.stdout.join('\n')).not.toContain('skipped');
   });
 
-  // DEV-935 / review F1 — `credits used` is THIS invocation's spend
-  // (settled − pre-trigger baseline), never the wire block's lifetime total.
+  // `credits used` is THIS invocation's spend (settled − pre-trigger
+  // baseline), never the wire block's lifetime total.
   it('nothing_to_start re-run: lifetime charges do NOT print as credits used (delta 0)', async () => {
     const backend = makePlanBackend({
       triggers: [{ body: { ...accepted(null, []), status: 'nothing_to_start' } }],
@@ -452,11 +452,12 @@ describe('runPlanGenerate — happy path', () => {
     expect(printed).toEqual(result);
   });
 
-  // DEV-935 review follow-up: a facade-side billing failure degrades the wire
-  // block to `{charged: [], balance: null}` — charged is DEFINED there, so the
+  // A facade-side billing failure degrades the wire block to
+  // `{charged: [], balance: null}` — charged is DEFINED there, so the
   // undefined-guard alone would diff the settled lifetime totals against an
-  // empty baseline and resurrect the F1 misreport. balance: null marks the
-  // degraded read; the figure must be omitted, not invented.
+  // empty baseline and resurrect the misreport above (the lifetime total
+  // printed as this invocation's spend). balance: null marks the degraded
+  // read; the figure must be omitted, not invented.
   it('degraded baseline credits block (charged: [], balance: null) yields null, never the lifetime total', async () => {
     let reads = 0;
     const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
@@ -514,8 +515,8 @@ describe('runPlanGenerate — happy path', () => {
     expect(backend.calls).toHaveLength(0);
   });
 
-  // DEV-384 review F5 — the plan leaves must honor TESTSPRITE_PROJECT_ID
-  // through the same house helpers as every other command.
+  // The plan leaves must honor TESTSPRITE_PROJECT_ID through the same house
+  // helpers as every other command.
   it('picks up TESTSPRITE_PROJECT_ID when --project is absent', async () => {
     const backend = makePlanBackend({});
     const capture: Capture = { stdout: [], stderr: [] };
@@ -584,7 +585,7 @@ describe('runPlanGenerate — first-run hint and credentials warning', () => {
     expect(stderr).toContain('[warn]');
     expect(stderr).toContain('test account');
     expect(stderr).toContain('still runs and still bills');
-    // DEV-937: the remedy is the CLI's own flags (they arm login server-side
+    // The remedy is the CLI's own flags (they arm login server-side
     // now), with the real project id substituted — not a Portal trip.
     expect(stderr).toContain(
       'testsprite project update project_plans_1 --username <user> --password-file <path>',

@@ -228,7 +228,7 @@ describe('assertLocalPortListening', () => {
     );
   });
 
-  it('names --skip-preflight exactly once (DEV-933)', async () => {
+  it('names --skip-preflight exactly once', async () => {
     const port = await closedLoopbackPort('127.0.0.1');
     let thrown: ApiError | undefined;
     try {
